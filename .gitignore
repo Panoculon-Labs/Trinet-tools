@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Local recording / output artefacts users may drop in for testing.
+# Keep these out of the repo.
+captures/
+out/
+*.mp4
+*.imu
+*.vts
+*.h264

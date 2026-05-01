@@ -1,0 +1,155 @@
+# Trinet-Tools
+
+Open-source utilities for working with recordings from the **Trinet camera** —
+a wearable, synchronized video + inertial-measurement camera designed for
+**egocentric (first-person) data collection** in camera-IMU calibration,
+visual-inertial SLAM, dead-reckoning research, and similar applications.
+
+This repository gives you everything you need to:
+
+- **Parse** the binary `.imu` and `.vts` sidecar files that accompany every
+  Trinet recording.
+- **Extract** sidecars from a UVC-captured MP4 (where the inertial data lives
+  embedded in the H.264 SEI stream) so they look identical to an on-board SD
+  recording.
+- **Visualize** a recording as a side-by-side video + inertial plot for sanity
+  checking and demos.
+
+If you only need to play back the video, `video.mp4` is a standard MP4 — open
+it in VLC. If you need the inertial data, read on.
+
+## Install
+
+```bash
+git clone https://github.com/Panoculon-Labs/Trinet-tools.git
+cd Trinet-tools
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`ffmpeg` and `ffprobe` must be on your `PATH` for the SEI extractor and the
+visualizer (most package managers install them as one package).
+
+## Recording layouts you may encounter
+
+A Trinet recording is **either**:
+
+1. **A triple of files** sharing a base name — `name.mp4 + name.imu + name.vts`.
+   This is what you'll find on the camera's SD card.
+
+2. **A per-session subdirectory** containing 10-minute "parts":
+
+       Trinet/recording1/
+         part001.mp4 + part001.imu + part001.vts
+         part002.mp4 + part002.imu + part002.vts
+         ...
+
+   Each part is independently playable and decodes as a complete recording.
+   This shape is enabled by some shipping configurations.
+
+3. **A single MP4** captured over USB (UVC) with the inertial data embedded as
+   SEI NAL units inside the H.264 stream. Use the SEI extractor below to turn
+   it into shape (1).
+
+All three shapes carry the same underlying data and the same monotonic
+nanosecond timeline.
+
+## Quickstart
+
+### Parse a recording in Python
+
+```python
+from trinet_tools.reader import read_imu, read_vts, interpolate_imu_to_frames
+
+imu = read_imu("recording1.imu")
+vts = read_vts("recording1.vts")
+
+print(f"{imu.num_samples} IMU samples over {imu.duration_s:.2f} s")
+print(f"actual sample rate: {imu.actual_rate_hz:.1f} Hz")
+print(f"device_id: {imu.header.device_id_hex or '(pre-v4 recording)'}")
+
+# Per-frame IMU samples aligned to video frames.
+per_frame = interpolate_imu_to_frames(imu, vts)
+for entry in per_frame[:5]:
+    print(entry["frame_number"], entry["accel"], entry["gyro"])
+```
+
+### Extract sidecars from a UVC MP4
+
+If you captured the camera over USB, your MP4 has the inertial data tucked
+inside the bitstream. To get the same `.imu`/`.vts` files an SD-card recording
+would have:
+
+```bash
+python -m trinet_tools.extract_sei input.mp4 --out my_recording/
+# Produces: my_recording/{video.mp4, video.imu, video.vts}
+```
+
+### Visualize a recording
+
+Render a synchronized video + inertial-data composite as MP4:
+
+```bash
+python scripts/visualize.py path/to/recording.mp4
+# Writes path/to/recording_viz.mp4 next to the input.
+
+python scripts/visualize.py path/to/recording.mp4 \
+    --plots orientation,accel,gyro,sync_delay
+```
+
+Works on a triple of files (`recording.mp4 + recording.imu + recording.vts`)
+or on a single UVC MP4 after running the SEI extractor.
+
+### Inspect a recording from the shell (no plots, just numbers)
+
+```bash
+python examples/inspect_recording.py path/to/recording.imu
+```
+
+## File format reference
+
+The full byte-level specification of `.imu` and `.vts` is at
+[`docs/data_formats.md`](docs/data_formats.md). Read this if you want to write
+your own parser in another language, or just to understand exactly what the
+camera is recording.
+
+Highlights:
+
+- **All timestamps are monotonic nanoseconds**, not wall-clock — they reset to
+  0 every time the camera powers on. This is what gives you tight, jitter-free
+  inertial-to-video alignment.
+- **Frame-sync alignment**: when enabled by firmware, every video frame
+  triggers a hardware pulse to the inertial sensor. The first IMU sample
+  after each pulse carries a sub-microsecond `fsync_delay_us`, letting you
+  align inertial data to a specific video frame to within ~1 µs (much tighter
+  than the IMU's own sample period).
+- **Device ID**: a stable 16-byte public identifier per camera unit, used to
+  attribute recordings to a specific physical camera. Carried in the `.imu`
+  header (on-board recordings) and as the USB iSerialNumber (UVC mode).
+
+## Compatibility
+
+These tools work with both **current and pre-v4 Trinet recordings**. The v4
+firmware added a `device_id` field to the `.imu` header's reserved bytes; the
+reader gracefully reports `device_id_hex == ""` for older recordings and is
+otherwise format-identical.
+
+If you have a recording with a different magic string or version that this
+library doesn't recognize, please file an issue — we'll add support.
+
+## Sibling projects
+
+- **[Trinet-Calibration](https://github.com/Panoculon-Labs/Trinet-Calibration)**
+  — Camera-IMU calibration pipeline that consumes these recordings and
+  produces `calibration.json` (intrinsics, extrinsics, time offset).
+- **[Trinet-SDK](https://github.com/Panoculon-Labs/Trinet-SDK)** — Android SDK
+  + sample app for capturing recordings from a USB-connected Trinet camera.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Reporting issues
+
+Issues and PRs are welcome at
+[github.com/Panoculon-Labs/Trinet-tools](https://github.com/Panoculon-Labs/Trinet-tools).
