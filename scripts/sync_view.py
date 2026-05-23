@@ -220,32 +220,46 @@ def render(cams, args):
         T = t0 + k * dt_ns
         canvas = np.full((out_h, total_w, 3), BG, np.uint8)
 
-        x = 0
-        max_resid_ms = 0.0
-        for ci, c in enumerate(cams):
+        # Pass 1: fetch each camera's nearest frame AND its true global SoF time.
+        # frame_for returns resid = (shown frame's global time) - T, so the shown
+        # frame's global time is T + resid. We compare cameras to EACH OTHER, not
+        # to the playback grid T: the grid beats against the capture rate (e.g.
+        # 30 fps output vs the capture rate rate-adjusted capture) so the per-camera
+        # distance-to-grid sweeps a full frame — but that's a render artifact, not
+        # the cross-camera sync. The cross-camera offset is the DIFFERENCE of the
+        # shown frames' global times, which is what actually matters.
+        frames, gts = [], []
+        for c in cams:
             fr, resid_ns = c.frame_for(T)
+            frames.append(fr)
+            gts.append(T + resid_ns)
+        ref = gts[0]                                  # camera 0 (master) = reference
+        cross_ms = [(g - ref) / 1e6 for g in gts]
+        spread_ms = (max(gts) - min(gts)) / 1e6       # true cross-camera simultaneity error
+
+        x = 0
+        for ci, c in enumerate(cams):
             pw = panel_w[ci]
             cell = canvas[HEADER_H:HEADER_H + args.height, x:x + pw]
-            if fr is not None:
-                cv2.resize(fr, (pw, args.height), dst=cell, interpolation=cv2.INTER_AREA)
-            # per-panel label strip
+            if frames[ci] is not None:
+                cv2.resize(frames[ci], (pw, args.height), dst=cell, interpolation=cv2.INTER_AREA)
+            # per-panel label strip: offset from the reference (master) camera.
             ly = HEADER_H + args.height
             cv2.rectangle(canvas, (x, ly), (x + pw, ly + LABEL_H), (40, 40, 40), -1)
-            resid_ms = resid_ns / 1e6
-            max_resid_ms = max(max_resid_ms, abs(resid_ms))
-            sync_txt = (f"  off={c.meta.get('master_clock_offset_ns', 0)/1e6:+.1f}ms"
-                        if c.meta else "")
             _put(canvas, f"{c.label}", (x + 6, ly + 17), 0.5, FG)
-            rc = ACCENT if abs(resid_ms) < 17 else WARN
-            _put(canvas, f"{resid_ms:+.1f}ms", (x + pw - 78, ly + 17), 0.45, rc)
+            off = cross_ms[ci]
+            lbl = "ref" if ci == 0 else f"{off:+.1f}ms"
+            rc = ACCENT if abs(off) < 2.0 else WARN
+            _put(canvas, lbl, (x + pw - 78, ly + 17), 0.45, rc)
             x += pw + PANEL_GAP
 
-        # header: elapsed global time + worst per-panel frame-phase residual
+        # header: elapsed global time + TRUE cross-camera offset (vs master),
+        # NOT the distance-to-playback-grid (which beats with the capture rate).
         cv2.rectangle(canvas, (0, 0), (total_w, HEADER_H), (40, 40, 40), -1)
         _put(canvas, f"t = {(T - t0)/1e9:8.3f} s   (master clock)", (8, 23), 0.6, FG)
         q = max((c.quality_us for c in cams), default=0)
-        _put(canvas, f"sync ~{q} us  |  max frame-phase {max_resid_ms:4.1f} ms",
-             (total_w - 360, 23), 0.5, ACCENT if q else WARN)
+        _put(canvas, f"sync ~{q} us  |  cross-cam {spread_ms:+5.2f} ms",
+             (total_w - 360, 23), 0.5, ACCENT if spread_ms < 2.0 else WARN)
 
         if args.show:
             cv2.imshow("trinet sync view", canvas)
