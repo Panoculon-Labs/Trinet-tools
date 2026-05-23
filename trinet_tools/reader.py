@@ -95,15 +95,36 @@ class ImuHeader:
         return self.device_id.hex()
 
 
+# v3 .vts header reserved[16] sync block (see the recording format):
+#   int64 master_clock_offset_ns | int32 clock_skew_ppb | uint16 quality_us | uint16 flags
+VTS_SYNC_FLAG_SYNCED    = 0x0001   # master_clock_offset_ns is valid
+VTS_SYNC_FLAG_IS_MASTER = 0x0002   # this device is the group master (offset 0)
+VTS_SYNC_FLAG_LINK_LOST = 0x0004   # sync link was down when stamped
+
+
 @dataclass
 class VtsHeader:
     magic: str
     version: int
     frame_rate_milli: int   # fps * 1000
+    # v3 multi-camera sync block (0 / unset for v1, v2):
+    master_clock_offset_ns: int = 0   # add to this device's sof to reach master clock
+    clock_skew_ppb: int = 0           # drift rate of this clock vs master (ppb)
+    sync_quality_us: int = 0          # est. 1-sigma offset error (µs)
+    sync_flags: int = 0               # VTS_SYNC_FLAG_*
 
     @property
     def fps(self) -> float:
         return self.frame_rate_milli / 1000.0
+
+    @property
+    def synced(self) -> bool:
+        """True if this recording carries a valid cross-camera clock offset."""
+        return bool(self.sync_flags & VTS_SYNC_FLAG_SYNCED)
+
+    @property
+    def is_master(self) -> bool:
+        return bool(self.sync_flags & VTS_SYNC_FLAG_IS_MASTER)
 
 
 @dataclass
@@ -173,6 +194,31 @@ class VtsData:
         if np.any(self.sof_timestamps_ns != 0):
             return self.sof_timestamps_ns
         return self.timestamps_ns
+
+    @property
+    def synced(self) -> bool:
+        """True if this recording can be placed on the shared master timeline."""
+        return self.header.synced
+
+    def global_sof_ns(self) -> np.ndarray:
+        """
+        Per-frame capture times mapped onto the **master's global clock**, so
+        frames from different cameras of the same take are directly comparable:
+
+            global = sof + master_clock_offset_ns + skew_ppb * (sof - sof0) / 1e9
+
+        The skew term drift-corrects within the recording; ``sof0`` is this
+        file's first frame (≈ when the offset was stamped). For an un-synced
+        recording (v1/v2 or master) this is just the local frame timestamps.
+        Returns int64 nanoseconds.
+        """
+        sof = self.best_timestamps_ns.astype(np.int64)
+        if not self.header.synced or sof.size == 0:
+            return sof
+        off = np.int64(self.header.master_clock_offset_ns)
+        skew = np.int64(self.header.clock_skew_ppb)
+        dt = sof - np.int64(sof[0])
+        return sof + off + (skew * dt) // np.int64(1_000_000_000)
 
     @property
     def num_frames(self) -> int:
@@ -308,6 +354,13 @@ def read_vts(path: str) -> VtsData:
             raise ValueError(f"Not a Trinet VTS file (magic={magic!r}, expected 'TRIVTS01')")
 
         header = VtsHeader(magic=magic, version=fields[1], frame_rate_milli=fields[2])
+        # v3: the 16-byte reserved block carries the cross-camera sync offset.
+        if header.version >= 3:
+            off, skew, qual, flags = struct.unpack("<qiHH", fields[3])
+            header.master_clock_offset_ns = off
+            header.clock_skew_ppb = skew
+            header.sync_quality_us = qual
+            header.sync_flags = flags
         data = f.read()
 
     if header.version >= 2:

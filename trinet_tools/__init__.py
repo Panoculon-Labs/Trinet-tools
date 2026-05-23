@@ -26,6 +26,12 @@ See ``docs/data_formats.md`` for the on-disk file layout.
 
 from . import reader      # noqa: F401
 from . import extract_sei  # noqa: F401
-from . import madgwick    # noqa: F401
+
+# madgwick depends on the optional `ahrs` package (orientation fusion). Keep it
+# optional so the core readers work without it; `madgwick` is None if missing.
+try:
+    from . import madgwick  # noqa: F401
+except ImportError:
+    madgwick = None
 
 __version__ = "1.0.0"
