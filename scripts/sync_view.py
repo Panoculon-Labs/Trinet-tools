@@ -223,8 +223,8 @@ def render(cams, args):
         # Pass 1: fetch each camera's nearest frame AND its true global SoF time.
         # frame_for returns resid = (shown frame's global time) - T, so the shown
         # frame's global time is T + resid. We compare cameras to EACH OTHER, not
-        # to the playback grid T: the grid beats against the capture rate (e.g.
-        # 30 fps output vs the capture rate rate-adjusted capture) so the per-camera
+        # to the playback grid T: when the cameras' capture rate differs slightly
+        # from the output fps, the grid beats against capture so the per-camera
         # distance-to-grid sweeps a full frame — but that's a render artifact, not
         # the cross-camera sync. The cross-camera offset is the DIFFERENCE of the
         # shown frames' global times, which is what actually matters.

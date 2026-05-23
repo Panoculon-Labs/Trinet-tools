@@ -95,11 +95,11 @@ class ImuHeader:
         return self.device_id.hex()
 
 
-# v3 .vts header reserved[16] sync block (see the recording format):
+# v3 .vts header reserved[16] sync block:
 #   int64 master_clock_offset_ns | int32 clock_skew_ppb | uint16 quality_us | uint16 flags
 VTS_SYNC_FLAG_SYNCED    = 0x0001   # master_clock_offset_ns is valid
 VTS_SYNC_FLAG_IS_MASTER = 0x0002   # this device is the group master (offset 0)
-VTS_SYNC_FLAG_LINK_LOST = 0x0004   # sync link was down when stamped
+VTS_SYNC_FLAG_LINK_LOST = 0x0004   # cross-camera sync link was down when stamped
 
 
 @dataclass
