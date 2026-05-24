@@ -191,6 +191,14 @@ def render(cams, args):
                          "are they the same take? (check session ids)")
     dt_ns = int(1e9 / args.fps)
 
+    # Offset reference = the group master (the camera whose clock the others are
+    # mapped onto), wherever it sits in the panel order. Falls back to the first
+    # camera if no master is identifiable. This lets the master sit anywhere
+    # (e.g. head cam in the centre) and still read "ref".
+    master_idx = next(
+        (i for i, c in enumerate(cams) if (c.meta or {}).get("role") == "master"),
+        0)
+
     # Panel geometry: scale each camera to a common height, keep aspect.
     panel_w = []
     for c in cams:
@@ -233,7 +241,7 @@ def render(cams, args):
             fr, resid_ns = c.frame_for(T)
             frames.append(fr)
             gts.append(T + resid_ns)
-        ref = gts[0]                                  # camera 0 (master) = reference
+        ref = gts[master_idx]                         # group master = reference
         cross_ms = [(g - ref) / 1e6 for g in gts]
         spread_ms = (max(gts) - min(gts)) / 1e6       # true cross-camera simultaneity error
 
@@ -248,7 +256,7 @@ def render(cams, args):
             cv2.rectangle(canvas, (x, ly), (x + pw, ly + LABEL_H), (40, 40, 40), -1)
             _put(canvas, f"{c.label}", (x + 6, ly + 17), 0.5, FG)
             off = cross_ms[ci]
-            lbl = "ref" if ci == 0 else f"{off:+.1f}ms"
+            lbl = "ref" if ci == master_idx else f"{off:+.1f}ms"
             rc = ACCENT if abs(off) < 2.0 else WARN
             _put(canvas, lbl, (x + pw - 78, ly + 17), 0.45, rc)
             x += pw + PANEL_GAP
