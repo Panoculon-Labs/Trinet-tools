@@ -163,6 +163,10 @@ def main():
                     help="comma list of 0-based panel indices whose video to rotate 180 "
                          "(e.g. inverted-mounted wrist cams): --rotate180 0,2")
     ap.add_argument("--watermark", default="", help="bottom-right watermark text")
+    ap.add_argument("--no-sync-info", action="store_true",
+                    help="hide the time-sync readouts (cross-camera offset, per-panel "
+                         "offset, and the 'master clock' annotation); keeps a plain "
+                         "elapsed-time clock, the camera labels, and orientation gizmos")
     args = ap.parse_args()
     rotate_set = {int(i) for i in args.rotate180.split(",") if i.strip() != ""}
 
@@ -226,9 +230,10 @@ def main():
             ly = HEADER_H + args.height
             cv2.rectangle(canvas, (x, ly), (x + pw, ly + LABEL_H), (40, 40, 40), -1)
             _put(canvas, c.label, (x + 6, ly + 17), 0.5, FG)
-            off = (gts[ci] - ref_g) / 1e6
-            _put(canvas, "ref" if ci == master_idx else f"{off:+.1f}ms",
-                 (x + pw - 78, ly + 17), 0.45, ACCENT if abs(off) < 2 else WARN)
+            if not args.no_sync_info:
+                off = (gts[ci] - ref_g) / 1e6
+                _put(canvas, "ref" if ci == master_idx else f"{off:+.1f}ms",
+                     (x + pw - 78, ly + 17), 0.45, ACCENT if abs(off) < 2 else WARN)
 
             ori = oris[ci]
             if ori is not None:
@@ -241,9 +246,12 @@ def main():
             x += pw + PANEL_GAP
 
         cv2.rectangle(canvas, (0, 0), (total_w, HEADER_H), (40, 40, 40), -1)
-        _put(canvas, f"t = {tc:8.3f} s   (master clock)", (8, 23), 0.6, FG)
-        _put(canvas, f"cross-cam {spread_ms:+5.2f} ms", (total_w - 230, 23), 0.55,
-             ACCENT if spread_ms < 2 else WARN)
+        if args.no_sync_info:
+            _put(canvas, f"t = {tc:8.3f} s", (8, 23), 0.6, FG)
+        else:
+            _put(canvas, f"t = {tc:8.3f} s   (master clock)", (8, 23), 0.6, FG)
+            _put(canvas, f"cross-cam {spread_ms:+5.2f} ms", (total_w - 230, 23), 0.55,
+                 ACCENT if spread_ms < 2 else WARN)
 
         if args.watermark:
             (tw, th), _ = cv2.getTextSize(args.watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
