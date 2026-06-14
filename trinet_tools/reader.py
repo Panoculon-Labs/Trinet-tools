@@ -37,10 +37,14 @@ IMU_SAMPLE_FMT_V1 = "<Qfffffffff"          # 44 bytes
 IMU_SAMPLE_SIZE_V1 = 44
 IMU_SAMPLE_FMT_V2 = "<Qfffffffffffffffff"  # 76 bytes
 IMU_SAMPLE_SIZE_V2 = 76
-IMU_SAMPLE_FMT_V3 = "<Qffffffffffffffffff" # 80 bytes (+fsync_delay_us)
+IMU_SAMPLE_FMT_V3 = "<Qffffffffffffffffff" # 80 bytes (+ one trailing float32)
 IMU_SAMPLE_SIZE_V3 = 80
 
-IMU_HDR_FLAG_FSYNC = 0x01
+IMU_HDR_FLAG_FSYNC = 0x01   # v3/v4: per-sample frame-sync delay is present
+IMU_HDR_FLAG_MAG = 0x02     # v5: magnetometer is present (mag[] + mag_age_us valid)
+# v3/v4 store fsync_delay_us in the trailing float; v5 reuses the SAME 80-byte
+# layout but reinterprets it as mag_age_us and populates mag[]. A v1-v4 reader
+# still parses a v5 file byte-for-byte.
 
 VTS_HEADER_FMT = "<8sII16s"
 VTS_HEADER_SIZE = 32
@@ -86,6 +90,33 @@ class ImuHeader:
     @property
     def fsync_enabled(self) -> bool:
         return bool(self.flags & IMU_HDR_FLAG_FSYNC)
+
+    @property
+    def mag_present(self) -> bool:
+        """True if this recording carries live magnetometer data (v5+ cameras)."""
+        return bool(self.flags & IMU_HDR_FLAG_MAG)
+
+    @property
+    def has_live_mag(self) -> bool:
+        """Alias for :attr:`mag_present`. On v3-generation cameras the ``mag``
+        vector holds real field data; on legacy cameras it is zero/absent."""
+        return self.mag_present
+
+    @property
+    def is_v3_generation(self) -> bool:
+        """True for the v3 Trinet generation (format version >= 5).
+
+        These units ship with the radio-beacon sync adapter and a live
+        magnetometer, and the trailing per-sample float is ``mag_age_us``
+        (not ``fsync_delay_us``). Legacy cameras report False.
+        """
+        return self.version >= 5
+
+    @property
+    def generation(self) -> str:
+        """Human-readable camera generation: ``"v3"`` (format >= 5 — live
+        magnetometer, radio-beacon adapter) or ``"legacy"`` (format <= 4)."""
+        return "v3" if self.version >= 5 else "legacy"
 
     @property
     def device_id_hex(self) -> str:
@@ -139,7 +170,11 @@ class ImuData:
     temp_c: Optional[np.ndarray] = None           # (N,) float32  — °C  (v2+)
     quat_xyzw: Optional[np.ndarray] = None        # (N,4) float32 — unit quaternion XYZW (v2+)
     lin_accel: Optional[np.ndarray] = None        # (N,3) float32 — m/s², gravity removed (v2+)
-    fsync_delay_us: Optional[np.ndarray] = None   # (N,) float32  — FSYNC delay µs (v3, 0=no pulse)
+    fsync_delay_us: Optional[np.ndarray] = None   # (N,) float32  — frame-sync delay µs (v3/v4, 0=no pulse)
+    mag_age_us: Optional[np.ndarray] = None       # (N,) float32  — v5: µs from this sample's timestamp
+                                                  #   back to the mag reading's timestamp. Absolute mag
+                                                  #   time = timestamps_ns - mag_age_us*1000. Reuses the
+                                                  #   v3/v4 fsync_delay_us slot; 0 = no mag.
 
     @property
     def timestamps_s(self) -> np.ndarray:
@@ -284,6 +319,8 @@ def read_imu(path: str) -> ImuData:
         )
         data = f.read()
 
+    # v5 reuses the v3/v4 80-byte layout; its trailing float is mag_age_us.
+    is_v5 = header.version >= 5
     is_v3 = header.version >= 3
     is_v2 = header.version >= 2
     if is_v3:
@@ -304,7 +341,8 @@ def read_imu(path: str) -> ImuData:
     temp_c = np.zeros(num_samples, dtype=np.float32) if is_v2 else None
     quat_xyzw = np.zeros((num_samples, 4), dtype=np.float32) if is_v2 else None
     lin_accel = np.zeros((num_samples, 3), dtype=np.float32) if is_v2 else None
-    fsync_delay_us = np.zeros(num_samples, dtype=np.float32) if is_v3 else None
+    fsync_delay_us = np.zeros(num_samples, dtype=np.float32) if (is_v3 and not is_v5) else None
+    mag_age_us = np.zeros(num_samples, dtype=np.float32) if is_v5 else None
 
     for i in range(num_samples):
         offset = i * sample_size
@@ -317,7 +355,10 @@ def read_imu(path: str) -> ImuData:
             temp_c[i] = s[10]
             quat_xyzw[i] = s[11:15]
             lin_accel[i] = s[15:18]
-        if is_v3:
+        # The trailing float is fsync_delay_us on v3/v4, mag_age_us on v5.
+        if is_v5:
+            mag_age_us[i] = s[18]
+        elif is_v3:
             fsync_delay_us[i] = s[18]
 
     return ImuData(
@@ -325,6 +366,7 @@ def read_imu(path: str) -> ImuData:
         accel=accel, gyro=gyro, mag=mag,
         temp_c=temp_c, quat_xyzw=quat_xyzw, lin_accel=lin_accel,
         fsync_delay_us=fsync_delay_us,
+        mag_age_us=mag_age_us,
     )
 
 

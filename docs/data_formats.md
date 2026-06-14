@@ -52,13 +52,13 @@ A 64-byte header followed by fixed-size sample records.
 | offset | size | type     | field            | meaning                                          |
 | ------ | ---- | -------- | ---------------- | ------------------------------------------------ |
 | 0      | 8    | char[8]  | magic            | ASCII `"TRIMU001"`                               |
-| 8      | 4    | uint32   | version          | 3 (current)                                      |
+| 8      | 4    | uint32   | version          | 3, 4, or 5 (5 current; all layout-compatible)    |
 | 12     | 4    | uint32   | sample_rate_hz   | nominal IMU output data rate (e.g. 562)          |
 | 16     | 2    | uint16   | accel_fs         | 0=±2 g, 1=±4 g, 2=±8 g, 3=±16 g                  |
 | 18     | 2    | uint16   | gyro_fs          | 0=±250, 1=±500, 2=±1000, 3=±2000 dps             |
 | 20     | 8    | uint64   | start_time_ns    | monotonic ns of first sample in this file        |
 | 28     | 8    | uint64   | video_start_ns   | monotonic ns of first video frame (0 if unknown) |
-| 36     | 4    | uint32   | flags            | bit 0 = frame-sync alignment captured            |
+| 36     | 4    | uint32   | flags            | bit 0 = frame-sync alignment captured; bit 1 = magnetometer present (v5) |
 | 40     | 24   | bytes    | reserved         | see device_id below                              |
 
 The first 16 bytes of `reserved` carry the **public device ID** — a stable
@@ -76,15 +76,16 @@ recording" — the rest of the file is fully compatible.
 | 0      | 8    | uint64   | timestamp_ns     | monotonic ns when the sample was acquired                        |
 | 8      | 12   | float[3] | accel[xyz]       | m/s² (gravity included)                                          |
 | 20     | 12   | float[3] | gyro[xyz]        | rad/s                                                            |
-| 32     | 12   | float[3] | mag[xyz]         | µT (zero if magnetometer unavailable)                            |
+| 32     | 12   | float[3] | mag[xyz]         | µT (live on v5; zero if magnetometer unavailable)                |
 | 44     | 4    | float    | temp_c           | °C (sensor die temperature)                                      |
 | 48     | 16   | float[4] | quat_xyzw        | reserved for on-device fusion; current firmware writes zeros     |
 | 64     | 12   | float[3] | lin_accel[xyz]   | reserved for on-device fusion; current firmware writes zeros     |
-| 76     | 4    | float    | fsync_delay_us   | µs offset between the nearest frame-sync pulse and this sample;  |
-|        |      |          |                  | 0 if no pulse landed in this sample's window                     |
+| 76     | 4    | float    | fsync_delay_us / mag_age_us | v3/v4: µs offset between the nearest frame-sync pulse and this sample (0 if none). v5: µs from this sample's timestamp back to the magnetometer reading in `mag[xyz]` |
 
-Number of samples = `(file_size - 64) / 80`. There is no count field and no
-trailer — readers compute the count from the file size.
+The trailing float at offset 76 is the same 4 bytes in every version; the header
+`version` (and `flags` bit 1) says whether it is `fsync_delay_us` (v3/v4) or
+`mag_age_us` (v5). Number of samples = `(file_size - 64) / 80`. There is no count
+field and no trailer — readers compute the count from the file size.
 
 ### Frame-sync alignment
 

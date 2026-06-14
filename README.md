@@ -68,6 +68,13 @@ print(f"{imu.num_samples} IMU samples over {imu.duration_s:.2f} s")
 print(f"actual sample rate: {imu.actual_rate_hz:.1f} Hz")
 print(f"device_id: {imu.header.device_id_hex or '(pre-v4 recording)'}")
 
+# Camera generation. "v3" units (radio-beacon sync adapter) carry a live
+# magnetometer; on them the per-sample trailing float is mag_age_us and
+# imu.mag[xyz] holds real field data. Legacy units report "legacy".
+print(f"generation: {imu.header.generation}  (live mag: {imu.header.has_live_mag})")
+if imu.header.is_v3_generation:
+    print(f"mag age (mean): {float(imu.mag_age_us.mean()):.0f} us")  # ~10-20 ms
+
 # Per-frame IMU samples aligned to video frames.
 per_frame = interpolate_imu_to_frames(imu, vts)
 for entry in per_frame[:5]:

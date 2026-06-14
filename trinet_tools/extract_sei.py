@@ -3,10 +3,12 @@
 # Copyright (c) 2026 Panoculon Labs. Part of the Trinet calibration toolkit.
 """
 Extract TRIMU IMU SEI payloads from a Trinet MP4 recording and write
-TRIMU001 v3 (.imu) + TRIVTS01 v2 (.vts) sidecars, plus a copy of the
-video as video.mp4. The output folder layout matches what
-tools/calibrate.py, calibrate_kalibr.py, and calibrate_viz.py
-already consume.
+TRIMU001 (.imu) + TRIVTS01 v2 (.vts) sidecars, plus a copy of the
+video as video.mp4. The .imu version tracks whatever the camera embedded
+(v3/v4 cameras carry a per-sample frame-sync delay; v5 cameras carry live
+magnetometer data + a mag_age_us timestamp in the same trailing float). The
+output folder layout matches what tools/calibrate.py, calibrate_kalibr.py,
+and calibrate_viz.py already consume.
 
 Usage:
     python3 extract_sei_sidecars.py input.mp4 --out folder/
@@ -32,6 +34,12 @@ TRIMU_UUID = bytes([
 SEI_TYPE_USER_DATA_UNREGISTERED = 5
 H264_NAL_TYPE_SEI = 6
 IMU_SAMPLE_SIZE_V3 = 80
+# Byte offset of the trailing float32 within an 80-byte sample:
+#   ts(8) + accel(12) + gyro(12) + mag(12) + temp(4) + quat(16) + lin_accel(12) = 76
+# It is fsync_delay_us on v3/v4 cameras and mag_age_us on v5 cameras.
+SAMPLE_TRAILING_FLOAT_OFFSET = 8 + 3 * 4 + 3 * 4 + 3 * 4 + 4 + 4 * 4 + 3 * 4
+IMU_HDR_FLAG_FSYNC = 0x01
+IMU_HDR_FLAG_MAG = 0x02
 
 
 def ffmpeg_extract_annexb(mp4: Path, out_h264: Path) -> None:
@@ -185,6 +193,7 @@ def extract(mp4: Path, out_dir: Path) -> None:
     gyro_fs = 0
     imu_version = 3
     fsync_seen = False
+    mag_seen = False
 
     frame_idx = -1
     for off, length in split_nal_units(bitstream):
@@ -200,11 +209,18 @@ def extract(mp4: Path, out_dir: Path) -> None:
                 imu_version = max(imu_version, ver)
                 if nsamp > 0:
                     first_ts = struct.unpack_from("<Q", samples_bytes, 0)[0]
-                    first_fsync_us = struct.unpack_from(
-                        "<f", samples_bytes, 8 + 3 * 4 + 3 * 4 + 3 * 4 + 4 + 4 * 4 + 3 * 4
+                    trailing_f = struct.unpack_from(
+                        "<f", samples_bytes, SAMPLE_TRAILING_FLOAT_OFFSET
                     )[0]
-                    if first_fsync_us > 0:
-                        fsync_seen = True
+                    # The trailing float is fsync_delay_us on v3/v4 cameras and
+                    # mag_age_us on v5 cameras (which have no frame-sync delay).
+                    if ver >= 5:
+                        mag_seen = True
+                        first_fsync_us = 0.0
+                    else:
+                        first_fsync_us = trailing_f
+                        if first_fsync_us > 0:
+                            fsync_seen = True
                     if not pending_has:
                         pending_first_ts = first_ts
                         pending_first_fsync_us = first_fsync_us
@@ -225,9 +241,10 @@ def extract(mp4: Path, out_dir: Path) -> None:
             pending_has = False
 
     total_samples = sum(len(b) // IMU_SAMPLE_SIZE_V3 for b in per_frame_samples)
-    print(f"[extract] frames={len(per_frame_samples)}  imu_samples={total_samples}  fsync={'yes' if fsync_seen else 'no'}")
+    print(f"[extract] frames={len(per_frame_samples)}  imu_samples={total_samples}  "
+          f"version={imu_version}  fsync={'yes' if fsync_seen else 'no'}  mag={'yes' if mag_seen else 'no'}")
 
-    # 2. Write imu.bin (TRIMU001 v3)
+    # 2. Write imu.bin (TRIMU001 — version mirrors what the camera embedded)
     start_time_ns = next((ts for ts in per_frame_first_sample_ts if ts > 0), 0)
     video_start_ns = start_time_ns
 
@@ -246,7 +263,7 @@ def extract(mp4: Path, out_dir: Path) -> None:
             if med > 0:
                 imu_rate_hz = int(round(1e9 / med))
 
-    flags = 1 if fsync_seen else 0
+    flags = (IMU_HDR_FLAG_FSYNC if fsync_seen else 0) | (IMU_HDR_FLAG_MAG if mag_seen else 0)
     header = struct.pack(
         "<8sIIHHQQI24s",
         b"TRIMU001",
@@ -292,7 +309,11 @@ def extract(mp4: Path, out_dir: Path) -> None:
             first_ts = per_frame_first_sample_ts[i]
             fsync_us = per_frame_first_sample_fsync_us[i]
             sof_ns = 0
-            if first_ts > 0:
+            # Only v3/v4 cameras carry a frame-sync delay we can subtract to get
+            # the Start-of-Frame time. v5 cameras have no such delay (the trailing
+            # float is mag_age_us), so leave sof=0 and let readers fall back to the
+            # VENC PTS timeline.
+            if imu_version < 5 and first_ts > 0:
                 sof_ns = int(first_ts - fsync_us * 1000.0)
             entry = struct.pack(
                 "<IQIQ",

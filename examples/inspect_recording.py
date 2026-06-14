@@ -46,8 +46,9 @@ def main():
     if imu_path.exists():
         imu = read_imu(str(imu_path))
         h = imu.header
+        import numpy as np
         print(f"  .imu  : {imu_path.name}")
-        print(f"          version       = {h.version}")
+        print(f"          version       = {h.version}  ({h.generation} generation)")
         print(f"          device_id     = {h.device_id_hex or '(pre-v4 recording)'}")
         print(f"          samples       = {imu.num_samples}")
         print(f"          duration      = {imu.duration_s:.3f} s")
@@ -55,11 +56,22 @@ def main():
               f"(nominal {h.sample_rate_hz} Hz)")
         print(f"          accel range   = {h.accel_fs_name}")
         print(f"          gyro range    = {h.gyro_fs_name}")
-        print(f"          fsync         = {'on' if h.fsync_enabled else 'off'}")
+        if h.is_v3_generation:
+            # v3 generation: live magnetometer; the trailing per-sample float is
+            # the magnetometer sample age (NOT a frame-sync delay).
+            print(f"          magnetometer  = live (v3 generation, radio-beacon adapter)")
+            if imu.mag_age_us is not None and len(imu.mag_age_us):
+                print(f"          mag age       = {float(np.median(imu.mag_age_us)):.0f} µs median "
+                      f"(mag samples ~100 Hz)")
+            if imu.num_samples > 0:
+                print(f"          mean |mag|    = "
+                      f"{float(np.mean(np.linalg.norm(imu.mag, axis=1))):.1f} µT")
+        else:
+            print(f"          fsync         = {'on' if h.fsync_enabled else 'off'}")
+            print(f"          magnetometer  = {'present' if h.mag_present else 'none'}")
         if imu.num_samples > 0:
-            import numpy as np
-            mag = float(np.mean(np.linalg.norm(imu.accel, axis=1)))
-            print(f"          mean |accel|  = {mag:.3f} m/s² "
+            print(f"          mean |accel|  = "
+                  f"{float(np.mean(np.linalg.norm(imu.accel, axis=1))):.3f} m/s² "
                   f"(stationary unit reads ~9.8)")
         print()
     else:
