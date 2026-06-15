@@ -113,6 +113,13 @@ or on a single UVC MP4 after running the SEI extractor.
 python examples/inspect_recording.py path/to/recording.imu
 ```
 
+## IMU ↔ video synchronization
+
+To align the IMU with video to sub-millisecond accuracy from a USB-streamed
+recording (no SD card needed) — and why a naive test can appear to show ~40 ms
+of "latency" — see [`docs/imu_video_sync.md`](docs/imu_video_sync.md). It
+includes a verification script you can run on your own clips.
+
 ## File format reference
 
 The full byte-level specification of `.imu` and `.vts` is at
