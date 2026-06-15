@@ -93,13 +93,3 @@ The IMU sample nearest each frame's hardware SoF is within **~0.35 ms (median)**
 and **< 1 ms (95th percentile)** — i.e. **sub-millisecond** sync, well inside a
 2 ms tolerance. To place a frame on the IMU timeline, use its `sof_timestamp_ns`
 (or interpolate the IMU at that time); never use the frame's PTS/arrival time.
-
-## Why a naive test shows ~40 ms
-
-If you instead measure *"when did the IMU sample arrive vs. when did its frame
-arrive on the host,"* you are measuring **delivery latency** — the time for the
-frame to be H.264-encoded on the camera, sent over USB, and decoded/buffered on
-the host (~30–40 ms, and it scales with bitrate/encoder load). That latency is
-real but it is **not** an IMU↔frame synchronization error: the capture
-timestamps embedded in the SEI already pin the two together to sub-millisecond.
-Use the SoF and the latency drops out entirely.
