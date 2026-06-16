@@ -12,8 +12,11 @@ This repository gives you everything you need to:
 - **Extract** sidecars from a UVC-captured MP4 (where the inertial data lives
   embedded in the H.264 SEI stream) so they look identical to an on-board SD
   recording.
-- **Visualize** a recording as a side-by-side video + inertial plot for sanity
-  checking and demos.
+- **Visualize** a single recording as a synchronized video + inertial-plot
+  composite for sanity checking and demos.
+- **Combine** several cameras from the same take into one synced, side-by-side
+  video — optionally with a per-camera orientation gizmo — so a multi-camera rig
+  (e.g. a head plus two wrist cameras) plays back on a single shared timeline.
 
 If you only need to play back the video, `video.mp4` is a standard MP4 — open
 it in VLC. If you need the inertial data, read on.
@@ -106,6 +109,45 @@ python scripts/visualize.py path/to/recording.mp4 \
 
 Works on a triple of files (`recording.mp4 + recording.imu + recording.vts`)
 or on a single UVC MP4 after running the SEI extractor.
+
+### Visualize multiple cameras together (synced)
+
+If you recorded the same take with several Trinet cameras — for example a head
+camera plus two wrist cameras — `sync_view.py` renders them **side by side on a
+single shared timeline**. Each camera's frames are placed on the group's master
+clock, so the same instant lines up across panels; the header shows the live
+cross-camera offset (typically well under a millisecond on a synced take) and
+each panel is labelled with its role and device tag. No calibration needed.
+
+```bash
+# two or more recordings of the same take
+# (each: a .mp4, a base name, or a chunk directory)
+python scripts/sync_view.py head.mp4 wristL.mp4 wristR.mp4 -o take_sync.mp4
+
+# ...or point at a folder and auto-group the cameras by session id
+python scripts/sync_view.py --auto path/to/recordings -o take_sync.mp4
+
+# ...or preview live in a window instead of writing a file
+python scripts/sync_view.py head.mp4 wristL.mp4 --show
+```
+
+To also show **each camera's orientation** on that timeline, use
+`sync_view_imu.py`. Below every video panel it draws a 3-axis gizmo of the
+camera's attitude, fused from its accelerometer and gyroscope (Madgwick) and
+expressed in the camera frame using the camera-IMU extrinsic from a
+`calibration.json` (produced by the [Trinet-Calibration](#sibling-projects)
+pipeline):
+
+```bash
+python scripts/sync_view_imu.py head.mp4 wristL.mp4 wristR.mp4 \
+    --imu calibration.json -o take_oriented.mp4
+```
+
+Both viewers accept the same recording shapes as the other commands (a file
+triple, a chunk directory, or a SEI-extracted UVC MP4), and the group's master
+camera is auto-detected and shown as the `ref` panel. If a camera is mounted
+upside-down — common for wrist units — flip its panel with `--rotate180`, e.g.
+`--rotate180 0,2` for the first and third panels.
 
 ### Inspect a recording from the shell (no plots, just numbers)
 
