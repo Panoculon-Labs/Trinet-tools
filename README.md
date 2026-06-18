@@ -35,27 +35,54 @@ visualizer (most package managers install them as one package).
 
 ## Recording layouts you may encounter
 
-A Trinet recording is **either**:
+Every recording is a set of files sharing one **base name**:
 
-1. **A triple of files** sharing a base name — `name.mp4 + name.imu + name.vts`.
-   This is what you'll find on the camera's SD card.
+- `<base>.mp4` — H.264 video
+- `<base>.imu` — inertial samples (accel/gyro/mag)
+- `<base>.vts` — per-frame video timestamps (+ a cross-camera sync offset)
+- `<base>.json` — a small, human-readable **recording-meta** sidecar: the session
+  and group ids, this camera's role and device id, and its clock-sync offset.
+  Full field reference in
+  [docs/data_formats.md](docs/data_formats.md#json-recording-meta-sidecar).
 
-2. **A per-session subdirectory** containing 10-minute "parts":
+The base name tells you how it was recorded:
 
-       Trinet/recording1/
-         part001.mp4 + part001.imu + part001.vts
-         part002.mp4 + part002.imu + part002.vts
-         ...
+- `grp<session>_<device>_<segment>` — a **synced multi-camera take** (a "wrist
+  kit"); every camera in the take shares the same `<session>`, e.g.
+  `grp72593_aa3d26ba_1`.
+- `<name>_<segment>` — a **solo recording**, e.g. `recording4_1` (its
+  `session`/`group` are `0`, `role` is `unpaired`).
 
-   Each part is independently playable and decodes as a complete recording.
-   This shape is enabled by some shipping configurations.
+…and it's stored as one of:
 
-3. **A single MP4** captured over USB (UVC) with the inertial data embedded as
-   SEI NAL units inside the H.264 stream. Use the SEI extractor below to turn
-   it into shape (1).
+1. **A file set on the SD card** under `Trinet/` — `<base>.{mp4,imu,vts,json}`.
+2. **A per-session subdirectory** of fixed-length "parts" (`part001.*`,
+   `part002.*`, …) when chunked recording is enabled; each part is independently
+   playable and decodes as a complete recording.
+3. **A single UVC MP4** captured over USB, with the inertial data embedded as SEI
+   NAL units inside the H.264 stream. Run the SEI extractor (below) to recover the
+   `.imu`/`.vts`.
 
-All three shapes carry the same underlying data and the same monotonic
-nanosecond timeline.
+All shapes carry the same underlying data and the same monotonic nanosecond
+timeline.
+
+### Wrist-kit sessions (several cameras, one take)
+
+A wrist kit films one moment with several cameras at once. Each camera writes to
+its OWN SD card, and every recording of the take shares the same `grp<session>` —
+only the device tag differs:
+
+    LEFT/   grp72593_aa3d26ba_1.{mp4,imu,vts,json}   # role: master (clock reference)
+    CENTRE/ grp72593_64ea7f5d_1.{mp4,imu,vts,json}   # role: slave
+    RIGHT/  grp72593_e96d9ce4_1.{mp4,imu,vts,json}   # role: slave
+
+The `LEFT`/`CENTRE`/`RIGHT` folders are just how you organise the cards — the
+cameras are tied together by the shared `session`/`group` in their filenames and
+`.json` sidecars, **not** by folder. One camera is the `master` (the clock
+reference); the others are `slave`, each carrying the offset that maps its frames
+onto the master's clock. That offset is what lets the toolkit lay all cameras on
+one timeline — render it with
+[the multi-camera viewer](#visualize-multiple-cameras-together-synced).
 
 ## Quickstart
 

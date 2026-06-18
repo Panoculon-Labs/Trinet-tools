@@ -10,15 +10,32 @@ times — they reset to 0 when the camera powers up).
 
 ## Recording shapes
 
-A recording exists in one of two shapes:
+Every recording is a small set of files that share one **base name**:
+
+    Trinet/<base>.mp4     # H.264 video
+    Trinet/<base>.imu     # inertial samples (accel/gyro/mag)
+    Trinet/<base>.vts     # per-frame video timestamps (+ cross-camera sync offset)
+    Trinet/<base>.json    # recording-meta sidecar (session / role / clock sync — see below)
+
+The base name tells you how the recording was made:
+
+- `grp<session>_<device-tag>_<segment>` — a **synced multi-camera take**, e.g.
+  `grp72593_aa3d26ba_1`. Every camera in the same take writes the SAME
+  `<session>` with its own `<device-tag>` (see shape 3 below).
+- `<name>_<segment>` — a **solo recording**, e.g. `recording4_1`
+  (its `session`/`group` are `0` and `role` is `unpaired`).
+
+`<segment>` starts at `1` and increments if a long take rolls into more than one
+file. The four files are stored in one of these shapes:
 
 ### 1. On-board SD recording (camera writes to its SD card)
 
-A triple of files sharing a base name, e.g.
+The file set lands flat under `Trinet/` on the camera's SD card, e.g.
 
-    Trinet/recording1.mp4    # H.264 video
-    Trinet/recording1.imu    # inertial samples
-    Trinet/recording1.vts    # per-frame video timestamps
+    Trinet/grp72593_aa3d26ba_1.mp4
+    Trinet/grp72593_aa3d26ba_1.imu
+    Trinet/grp72593_aa3d26ba_1.vts
+    Trinet/grp72593_aa3d26ba_1.json
 
 If the camera firmware is configured for chunked recording, you'll get a
 per-session subdirectory instead, with the recording sliced into fixed-length
@@ -42,6 +59,26 @@ as SEI (Supplemental Enhancement Information) NAL units carrying a Trinet
 "TRIMU" UUID. Use `trinet_tools.extract_sei` to split such an MP4 back into the
 same .mp4 / .imu / .vts triple as an on-board recording — at which point the
 rest of the toolkit treats it identically.
+
+### 3. Multi-camera (wrist-kit) session
+
+When several cameras record the same take at once (a "wrist kit"), each camera
+writes its OWN file set to its OWN SD card, and **every camera in one take shares
+the same `grp<session>`** — only the `<device-tag>` differs. A three-camera
+session looks like this (one folder per camera, however you copy them off the
+cards):
+
+    LEFT/   grp72593_aa3d26ba_1.{mp4,imu,vts,json}    # role: master
+    CENTRE/ grp72593_64ea7f5d_1.{mp4,imu,vts,json}    # role: slave
+    RIGHT/  grp72593_e96d9ce4_1.{mp4,imu,vts,json}    # role: slave
+
+The folder names (`LEFT`/`CENTRE`/`RIGHT`) are just how you organise the cards —
+the cameras are tied together by the shared `session`/`group` ids in their
+filenames and `.json` sidecars, **not** by folder. Exactly one camera is the
+`master` (the clock reference, `master_clock_offset_ns = 0`); the rest are
+`slave`, each carrying the offset that maps its frames onto the master's clock.
+That offset (in the `.json` and the `.vts` header) is what lets the toolkit place
+all cameras on a single timeline — see `scripts/sync_view.py` in the README.
 
 ## `.imu` file format (TRIMU001)
 
@@ -182,6 +219,57 @@ encoder pipeline latency relative to the actual capture instant.
 
 In chunked recordings, `frame_number` resets to 0 at the start of each part —
 so each part's `.vts` reads independently.
+
+## `.json` recording-meta sidecar
+
+A small, human-readable `<base>.json` sits next to every recording. It identifies
+the recording and — for a synced multi-camera take — describes how this camera
+relates to the others. Example (a wrist-kit **slave** camera):
+
+```json
+{
+  "format": "trinet-recording-meta/1",
+  "session": 72593,
+  "group": 48477,
+  "role": "slave",
+  "device_id": "64ea7f5da17f71e411e8f1a8103a1558",
+  "device_tag": "64ea7f5d",
+  "segment": 1,
+  "synced": true,
+  "master_clock_offset_ns": -4642873007,
+  "clock_skew_ppb": 28617,
+  "sync_quality_us": 610,
+  "sync_flags": 1,
+  "mode": "single",
+  "basename": "grp72593_64ea7f5d_1",
+  "created_unix": 79
+}
+```
+
+| field | meaning |
+|---|---|
+| `format` | schema id, currently `trinet-recording-meta/1` |
+| `session` | recording-session id; **every camera in one synced take shares it** (`0` = solo) |
+| `group` | the pairing-group (kit) id the camera belongs to (`0` = unpaired) |
+| `role` | `master`, `slave`, or `unpaired`. The **master** is the clock reference |
+| `device_id` | 32-hex public camera id — the same value as the `.imu` header device_id and the USB serial in UVC mode |
+| `device_tag` | first 8 hex of `device_id`; this is the `<device-tag>` in the `grp<session>_<device-tag>_<segment>` filename |
+| `segment` | part index when a long take rolls into multiple files (starts at `1`) |
+| `synced` | `true` when `master_clock_offset_ns` is valid (this camera is clock-synced to the master) |
+| `master_clock_offset_ns` | add to this camera's `.vts` start-of-frame timestamps to map them onto the **master's** clock (`0` on the master itself) |
+| `clock_skew_ppb` | residual clock-rate mismatch vs the master, parts-per-billion, for drift correction over long takes |
+| `sync_quality_us` | estimated one-way cross-camera sync uncertainty, microseconds (`0` on the master) |
+| `sync_flags` | bitfield: `0x1` = synced (offset valid), `0x2` = this camera is the master. So master = `3`, synced slave = `1`, unpaired = `0` |
+| `mode` | recording mode (`single`) |
+| `basename` | the shared base name of the file set |
+| `created_unix` | the camera's clock at creation — **seconds since the camera last powered on**, not wall-clock (the camera keeps no real-time clock; see the monotonic-timeline note above) |
+
+The sync fields (`synced`, `master_clock_offset_ns`, `clock_skew_ppb`,
+`sync_quality_us`, and the master flag) are a convenience copy of what the `.vts`
+v3 header already carries — that header is what the Python reader uses, so
+`read_vts(path).global_sof_ns()` returns each camera's frames already mapped onto
+the master clock. The `.json` is the easy way to see, at a glance, which take a
+file belongs to and which camera is the master.
 
 ## `video.mp4`
 
