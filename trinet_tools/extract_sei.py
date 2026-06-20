@@ -159,7 +159,14 @@ def decode_trimu_sei(nal: bytes):
         num_samples = int.from_bytes(payload[17:19], "little")
         accel_fs = int.from_bytes(payload[19:21], "little")
         gyro_fs = int.from_bytes(payload[21:23], "little")
-        samples = payload[23:23 + num_samples * IMU_SAMPLE_SIZE_V3]
+        # v6 inserts a per-frame timing block between gyro_fs and the samples:
+        #   frame_sof_ts_ns(8) + exposure_us(4) + timing_flags(1) + readout_time_us(4)
+        #   = 17 bytes → samples start at 23 + 17 = 40.
+        # Samples remain the 80-byte v5 layout.
+        sample_base = 40 if version >= 6 else 23
+        if len(payload) < sample_base:
+            continue
+        samples = payload[sample_base:sample_base + num_samples * IMU_SAMPLE_SIZE_V3]
         if len(samples) < num_samples * IMU_SAMPLE_SIZE_V3:
             return None
         return samples, accel_fs, gyro_fs, version, num_samples

@@ -51,9 +51,19 @@ VTS_HEADER_SIZE = 32
 VTS_ENTRY_FMT_V1 = "<IQ"
 VTS_ENTRY_SIZE_V1 = 12
 
-# v2: frame_number(uint32), sof_timestamp_ns(uint64), venc_seq(uint32), venc_pts_us(uint64)
+# v2/v3: frame_number(uint32), sof_timestamp_ns(uint64), venc_seq(uint32), venc_pts_us(uint64)
 VTS_ENTRY_FMT_V2 = "<IQIQ"
 VTS_ENTRY_SIZE_V2 = 24
+# v4: appends exposure_us(uint32) + entry_flags(uint32). sof_timestamp_ns is the
+# mid-exposure frame time when TIMING_MID_EXPOSURE is set (else raw start-of-frame).
+# v4: appends exposure_us(uint32) + entry_flags(uint32) + readout_time_us(uint32).
+# readout_time_us = rolling-shutter readout span (µs); per-row delay =
+# readout_time_us / image_height (the Kalibr line_delay).
+VTS_ENTRY_FMT_V4 = "<IQIQIII"
+VTS_ENTRY_SIZE_V4 = 36
+TIMING_MID_EXPOSURE = 0x01    # frame timestamp is exposure-center (else start-of-frame)
+TIMING_EXPOSURE_VALID = 0x02  # exposure_us is valid
+TIMING_READOUT_VALID = 0x04   # readout_time_us is valid
 
 ACCEL_FS_NAMES = {0: "±2 g", 1: "±4 g", 2: "±8 g", 3: "±16 g"}
 GYRO_FS_NAMES = {0: "±250 dps", 1: "±500 dps", 2: "±1000 dps", 3: "±2000 dps"}
@@ -205,9 +215,19 @@ class VtsData:
     header: VtsHeader
     frame_numbers: np.ndarray       # (M,) uint32
     timestamps_ns: np.ndarray       # (M,) uint64
-    sof_timestamps_ns: Optional[np.ndarray] = None  # (M,) uint64 (v2 only; 0 if unknown)
-    venc_seq: Optional[np.ndarray] = None           # (M,) uint32 (v2 only)
-    venc_pts_us: Optional[np.ndarray] = None        # (M,) uint64 (v2 only)
+    sof_timestamps_ns: Optional[np.ndarray] = None  # (M,) uint64 (v2+; 0 if unknown)
+    venc_seq: Optional[np.ndarray] = None           # (M,) uint32 (v2+)
+    venc_pts_us: Optional[np.ndarray] = None        # (M,) uint64 (v2+)
+    exposure_us: Optional[np.ndarray] = None        # (M,) uint32 (v4+; 0 if unknown)
+    timing_flags: Optional[np.ndarray] = None       # (M,) uint32 (v4+; TIMING_*)
+    readout_time_us: Optional[np.ndarray] = None     # (M,) uint32 (v5+; rolling-shutter span µs)
+
+    @property
+    def is_mid_exposure(self) -> bool:
+        """True if frame timestamps are exposure-center (v4 mid-exposure)."""
+        if self.timing_flags is None or len(self.timing_flags) == 0:
+            return False
+        return bool(int(self.timing_flags[0]) & TIMING_MID_EXPOSURE)
 
     @property
     def timestamps_s(self) -> np.ndarray:
@@ -404,6 +424,45 @@ def read_vts(path: str) -> VtsData:
             header.sync_quality_us = qual
             header.sync_flags = flags
         data = f.read()
+
+    if header.version >= 4:
+        # v4 = 36-byte entry: v2 fields + exposure_us + entry_flags + readout_time_us.
+        num_entries = len(data) // VTS_ENTRY_SIZE_V4
+        frame_numbers = np.zeros(num_entries, dtype=np.uint32)
+        sof_ts = np.zeros(num_entries, dtype=np.uint64)
+        venc_seq = np.zeros(num_entries, dtype=np.uint32)
+        venc_pts_us = np.zeros(num_entries, dtype=np.uint64)
+        exposure_us = np.zeros(num_entries, dtype=np.uint32)
+        timing_flags = np.zeros(num_entries, dtype=np.uint32)
+        readout_us = np.zeros(num_entries, dtype=np.uint32)
+
+        for i in range(num_entries):
+            offset = i * VTS_ENTRY_SIZE_V4
+            fn, sof, seq, pts, exp, fl, ro = struct.unpack(
+                VTS_ENTRY_FMT_V4, data[offset:offset + VTS_ENTRY_SIZE_V4])
+            frame_numbers[i] = fn
+            sof_ts[i] = sof
+            venc_seq[i] = seq
+            venc_pts_us[i] = pts
+            exposure_us[i] = exp
+            timing_flags[i] = fl
+            readout_us[i] = ro
+
+        # sof_timestamps_ns already carries the mid-exposure shift on-device when
+        # TIMING_MID_EXPOSURE is set; best_timestamps_ns prefers it.
+        timestamps = (venc_pts_us.astype(np.uint64) * np.uint64(1000))
+
+        return VtsData(
+            header=header,
+            frame_numbers=frame_numbers,
+            timestamps_ns=timestamps,
+            sof_timestamps_ns=sof_ts,
+            venc_seq=venc_seq,
+            venc_pts_us=venc_pts_us,
+            exposure_us=exposure_us,
+            timing_flags=timing_flags,
+            readout_time_us=readout_us,
+        )
 
     if header.version >= 2:
         num_entries = len(data) // VTS_ENTRY_SIZE_V2
