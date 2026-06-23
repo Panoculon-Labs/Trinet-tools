@@ -22,7 +22,7 @@ two layers:
   the camera's monotonic clock and are latched in hardware, so delivery latency
   cancels out and the nearest IMU sample lands **sub-millisecond** from the frame.
 - For the final, physically-correct alignment, **add the Kalibr `timeshift_cam_imu`**
-  (≈ −15 ms here). `sof_timestamp_ns` gives you sub-ms *precision*; the timeshift
+  (≈ −16.5 ms here). `sof_timestamp_ns` gives you sub-ms *precision*; the timeshift
   removes the systematic *offset* between the frame's reported time and its true
   effective capture instant. See [Post-calibration refinement](#post-calibration-refinement-kalibr-timeshift).
 
@@ -128,8 +128,16 @@ print(f"frame-to-nearest-IMU: median {np.median(nearest_us):.3f} us, "
       f"95th pct {np.percentile(nearest_us, 95):.3f} us")
 ```
 
-The IMU sample nearest each frame's timestamp is within **~0.35 ms (median)** and
-**< 1 ms (95th percentile)** — sub-millisecond *precision* on the IMU timeline. To
+On a representative v6 recording (96.9 s, 2 907 frames, 400 Hz IMU) this prints:
+
+```
+cadence: 33.333 ms (30.00 fps), std 0.519 ms, monotonic=True
+frame-to-nearest-IMU: median 838.583 us, 95th pct 1191.529 us
+```
+
+The IMU sample nearest each frame's timestamp is **sub-millisecond at the median**
+(~0.84 ms) and ~1.2 ms at the 95th percentile — bounded by the IMU sample period
+(≈2.5 ms at 400 Hz, i.e. ≤ ½ period). That is *precision* on the IMU timeline. To
 place a frame on that timeline, use its `sof_timestamp_ns` (or interpolate the IMU
 at that time); never use the frame's PTS / arrival time.
 
@@ -147,20 +155,21 @@ camera with a wide fisheye + IMU, that residual is:
 
 - **+ half the rolling-shutter readout** — `sof_timestamp_ns` is referenced to the
   top row, but the bulk of the image (the centre row) is read out ~`readout/2`
-  later. With a ~26.5 ms readout that's **~13 ms** — the dominant term. (Because
-  `sof` is already mid-*exposure*, the exposure time itself cancels here and the
-  offset does **not** drift with auto-exposure.)
+  later. With the example's 26.47 ms readout that's **~13.2 ms** — the dominant
+  term. (Because `sof` is already mid-*exposure*, the exposure time itself cancels
+  here and the offset does **not** drift with auto-exposure.)
 - **+ IMU group delay + pipeline latency** — the inertial sensor's internal
   filtering delays its samples by ~1–2 ms, plus small constant ISP/transport
-  offsets.
+  offsets (~3 ms total on the example).
 
-These sum to a stable per-design constant (**≈ 15 ms** for the current cameras).
+These sum to a stable per-design constant — **−16.5 ms on the example recording**
+(typically −15 to −16.5 ms across units, spread < 1 ms).
 Kalibr's camera–IMU calibration estimates exactly this as **`timeshift_cam_imu`**,
 written into `calibration.json`:
 
 ```json
 "extrinsics": {
-  "timeshift_cam_imu_sec": -0.0156,
+  "timeshift_cam_imu_sec": -0.01652,
   "timeshift_sign_convention": "t_imu = t_cam + timeshift_cam_imu_sec"
 }
 ```
@@ -197,7 +206,7 @@ line_delay = readout_time_us * 1000 / image_height        # ns per row
 
 where `r_ref` is the row the timestamp references (image centre when
 `TIMING_MID_EXPOSURE` is set). `readout_time_us` is a fixed property of the sensor
-mode (≈ 26.5 ms over 1080 rows ≈ 24.5 µs/row here) and is available per-frame in
+mode (26.47 ms over 1080 rows = 24.5 µs/row on the example) and is available per-frame in
 v4+ `.vts`. Most consumers can ignore this and treat the frame as captured at
 `sof + timeshift`; VIO front-ends that model rolling shutter should use `line_delay`.
 
