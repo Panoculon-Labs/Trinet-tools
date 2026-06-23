@@ -3,10 +3,12 @@
 # Copyright (c) 2026 Panoculon Labs. Part of the Trinet calibration toolkit.
 """
 Extract TRIMU IMU SEI payloads from a Trinet MP4 recording and write
-TRIMU001 (.imu) + TRIVTS01 v2 (.vts) sidecars, plus a copy of the
+TRIMU001 (.imu) + TRIVTS01 (.vts) sidecars, plus a copy of the
 video as video.mp4. The .imu version tracks whatever the camera embedded
 (v3/v4 cameras carry a per-sample frame-sync delay; v5 cameras carry live
-magnetometer data + a mag_age_us timestamp in the same trailing float). The
+magnetometer data + a mag_age_us timestamp in the same trailing float; v6
+cameras add a per-frame mid-exposure timing block). The `.vts` is written as
+TRIVTS01 v4 (sof + exposure + readout) for v6 cameras, else v2. The
 output folder layout matches what tools/calibrate.py, calibrate_kalibr.py,
 and calibrate_viz.py already consume.
 
@@ -166,10 +168,19 @@ def decode_trimu_sei(nal: bytes):
         sample_base = 40 if version >= 6 else 23
         if len(payload) < sample_base:
             continue
+        # v6 per-frame timing block at payload[23:40]: mid-exposure frame time +
+        # applied exposure + rolling-shutter readout span. None for v<6 cameras.
+        timing = None
+        if version >= 6:
+            frame_sof_ts_ns = int.from_bytes(payload[23:31], "little")
+            exposure_us = int.from_bytes(payload[31:35], "little")
+            timing_flags = payload[35]
+            readout_time_us = int.from_bytes(payload[36:40], "little")
+            timing = (frame_sof_ts_ns, exposure_us, timing_flags, readout_time_us)
         samples = payload[sample_base:sample_base + num_samples * IMU_SAMPLE_SIZE_V3]
         if len(samples) < num_samples * IMU_SAMPLE_SIZE_V3:
             return None
-        return samples, accel_fs, gyro_fs, version, num_samples
+        return samples, accel_fs, gyro_fs, version, num_samples, timing
     return None
 
 
@@ -191,9 +202,11 @@ def extract(mp4: Path, out_dir: Path) -> None:
     per_frame_samples: list[bytes] = []
     per_frame_first_sample_ts: list[int] = []
     per_frame_first_sample_fsync_us: list[float] = []
+    per_frame_timing: list = []          # v6: (sof_ns, exposure_us, flags, readout_us) | None
     pending_sample_bytes = bytearray()
     pending_first_ts = 0
     pending_first_fsync_us = 0.0
+    pending_timing = None
     pending_has = False
 
     accel_fs = 0
@@ -210,7 +223,7 @@ def extract(mp4: Path, out_dir: Path) -> None:
         if nal_type == H264_NAL_TYPE_SEI:
             result = decode_trimu_sei(nal_bytes)
             if result is not None:
-                samples_bytes, a_fs, g_fs, ver, nsamp = result
+                samples_bytes, a_fs, g_fs, ver, nsamp, timing = result
                 accel_fs = a_fs
                 gyro_fs = g_fs
                 imu_version = max(imu_version, ver)
@@ -231,6 +244,7 @@ def extract(mp4: Path, out_dir: Path) -> None:
                     if not pending_has:
                         pending_first_ts = first_ts
                         pending_first_fsync_us = first_fsync_us
+                        pending_timing = timing
                         pending_has = True
                     pending_sample_bytes.extend(samples_bytes)
         elif 1 <= nal_type <= 5:
@@ -240,11 +254,14 @@ def extract(mp4: Path, out_dir: Path) -> None:
                 per_frame_samples.append(bytes(pending_sample_bytes))
                 per_frame_first_sample_ts.append(pending_first_ts)
                 per_frame_first_sample_fsync_us.append(pending_first_fsync_us)
+                per_frame_timing.append(pending_timing)
             else:
                 per_frame_samples.append(b"")
                 per_frame_first_sample_ts.append(0)
                 per_frame_first_sample_fsync_us.append(0.0)
+                per_frame_timing.append(None)
             pending_sample_bytes = bytearray()
+            pending_timing = None
             pending_has = False
 
     total_samples = sum(len(b) // IMU_SAMPLE_SIZE_V3 for b in per_frame_samples)
@@ -292,13 +309,13 @@ def extract(mp4: Path, out_dir: Path) -> None:
             f.write(blob)
     print(f"[extract] wrote {imu_path} ({imu_path.stat().st_size} bytes, rate≈{imu_rate_hz} Hz)")
 
-    # 3. Write frames.bin (TRIVTS01 v2)
+    # 3. Write frames.bin. v6 cameras carry a per-frame mid-exposure timing block
+    #    -> emit TRIVTS01 v4 (sof + exposure + flags + readout). Older cameras ->
+    #    TRIVTS01 v2 (sof from the frame-sync delay, or 0 / PTS-fallback on v5).
+    use_v6 = imu_version >= 6
+    vts_version = 4 if use_v6 else 2
     vts_header = struct.pack(
-        "<8sII16s",
-        b"TRIVTS01",
-        2,  # version
-        int(round(fps * 1000)),
-        b"\x00" * 16,
+        "<8sII16s", b"TRIVTS01", vts_version, int(round(fps * 1000)), b"\x00" * 16,
     )
     vts_path = out_dir / "frames.bin"
     n_frames = len(per_frame_samples)
@@ -313,24 +330,26 @@ def extract(mp4: Path, out_dir: Path) -> None:
     with open(vts_path, "wb") as f:
         f.write(vts_header)
         for i in range(n_frames):
-            first_ts = per_frame_first_sample_ts[i]
-            fsync_us = per_frame_first_sample_fsync_us[i]
-            sof_ns = 0
-            # Only v3/v4 cameras carry a frame-sync delay we can subtract to get
-            # the Start-of-Frame time. v5 cameras have no such delay (the trailing
-            # float is mag_age_us), so leave sof=0 and let readers fall back to the
-            # VENC PTS timeline.
-            if imu_version < 5 and first_ts > 0:
-                sof_ns = int(first_ts - fsync_us * 1000.0)
-            entry = struct.pack(
-                "<IQIQ",
-                i,              # frame_number
-                sof_ns,         # sof_timestamp_ns
-                i,              # venc_seq (we don't have the encoder seq; use idx)
-                int(pts_us[i]),
-            )
+            timing = per_frame_timing[i]
+            if use_v6 and timing is not None:
+                sof_ns, exposure_us, flags, readout_us = timing
+                # v4 entry: v2 fields + exposure_us, entry_flags, readout_time_us.
+                # sof is the device mid-exposure frame time (already exposure-centred).
+                entry = struct.pack("<IQIQIII", i, int(sof_ns), i, int(pts_us[i]),
+                                    int(exposure_us), int(flags), int(readout_us))
+            elif use_v6:
+                entry = struct.pack("<IQIQIII", i, 0, i, int(pts_us[i]), 0, 0, 0)
+            else:
+                first_ts = per_frame_first_sample_ts[i]
+                fsync_us = per_frame_first_sample_fsync_us[i]
+                # v3/v4 cameras: sof = first sample time - frame-sync delay. v5
+                # cameras have no frame-sync delay -> sof=0, readers fall back to PTS.
+                sof_ns = (int(first_ts - fsync_us * 1000.0)
+                          if (imu_version < 5 and first_ts > 0) else 0)
+                entry = struct.pack("<IQIQ", i, sof_ns, i, int(pts_us[i]))
             f.write(entry)
-    print(f"[extract] wrote {vts_path} ({vts_path.stat().st_size} bytes, {n_frames} entries)")
+    print(f"[extract] wrote {vts_path} ({vts_path.stat().st_size} bytes, "
+          f"{n_frames} entries, TRIVTS01 v{vts_version})")
 
     # 4. Build a clean video.mp4 that OpenCV can decode end-to-end.
     #    Android-wrapped Trinet MP4s often have leading access units that

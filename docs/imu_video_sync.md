@@ -26,6 +26,44 @@ two layers:
   removes the systematic *offset* between the frame's reported time and its true
   effective capture instant. See [Post-calibration refinement](#post-calibration-refinement-kalibr-timeshift).
 
+## Which version do I have? (and how to sync it)
+
+Trinet recordings have evolved across hardware generations and firmware, so the
+exact timestamp you align to depends on the format version. You can identify it
+without guessing:
+
+- **From a UVC `.mp4`:** run `extract_sei` (below). It prints
+  `version=N  fsync=…  mag=…` — `N` is the in-stream **SEI version** — and writes
+  the sidecars.
+- **From sidecars directly:** the version is a `uint32` right after the 8-byte
+  magic. `read_imu(...).header.version` / `read_vts(...).header.version`, or by
+  hand: bytes 8–11 of `*.imu` (magic `TRIMU001`) and of `*.vts` (magic `TRIVTS01`).
+
+| What you have | `.imu` ver | `.vts` ver | SEI ver | Generation | Frame timestamp (`sof`) | How to time-sync |
+|---|---|---|---|---|---|---|
+| Earliest | 1–2 | 1 | — | pre-release | frame time only, no `sof` | limited — frame-level only |
+| **Frame-sync** | 3–4 | 2 / 3 | 3 / 4 | legacy (v1/v2 hardware) | `sof = sample_ts − fsync_delay_us` (**start-of-frame**, from the frame-sync pulse) | align IMU → `sof`, then **+ `timeshift_cam_imu`** |
+| **Magnetometer, no mid-exposure** | 5 | 2 / 3 | 5 | v3 generation, early firmware | host-latched **start-of-frame** (in `.vts sof_timestamp_ns`; **0 if extracted from UVC** — use the device's on-board `.vts`) | align IMU → `sof`, then **+ `timeshift_cam_imu`** |
+| **Mid-exposure** *(current)* | 5 | 4 | 6 | v3 generation, current firmware | **mid-exposure** frame time, plus `exposure_us` + `readout_time_us` | align IMU → `sof`, **+ `timeshift_cam_imu`**, optional `line_delay` |
+
+Key points:
+- **Every version** aligns the IMU to the same thing — the per-frame `sof` on the
+  camera's monotonic clock — and **never** to the video PTS. The differences are
+  only *where the `sof` comes from* and *what it is referenced to*.
+- **Start-of-frame vs mid-exposure** matters for the residual offset: on
+  mid-exposure (`.vts` v4) recordings the exposure term is already removed, so the
+  calibrated `timeshift_cam_imu` only has to absorb the readout-centre + sensor
+  group delay; on the older start-of-frame recordings the timeshift additionally
+  absorbs the exposure-centre. Either way you apply it the same way — just use the
+  `timeshift` from **that recording's** calibration.
+- **Magnetometer-generation (`.imu` v5) cameras over UVC, SEI v5:** the SEI carries
+  no per-frame hardware timestamp, so `extract_sei` leaves `sof = 0`. Use the
+  camera's **on-board `.vts`** (which has the host-latched `sof`), or update the
+  camera to current firmware (SEI v6 → `.vts` v4, `sof` recoverable from the stream).
+
+The two sections below detail the current (mid-exposure) format; everything
+generalises across versions via the table above.
+
 ## What's actually in the stream
 
 Each encoded video frame is preceded by an SEI NAL carrying the IMU samples for

@@ -8,6 +8,11 @@ All multi-byte integers and floats are **little-endian**. All timestamps are
 **monotonic nanoseconds** (i.e. they always increase, but they are not wall-clock
 times — they reset to 0 when the camera powers up).
 
+> The format `version` (in each file's header, right after the magic) tells you
+> which camera generation produced the recording and which timestamp to align to.
+> For the version → generation map **and how to time-sync each one**, see
+> [`imu_video_sync.md`](imu_video_sync.md).
+
 ## Recording shapes
 
 Every recording is a small set of files that share one **base name**:
@@ -100,8 +105,9 @@ header `version`.
 | 3       | 80 bytes    | + trailing `fsync_delay_us`; header gains `flags` (bit 0 = frame-sync) and the 16-byte `device_id`  |
 | 4       | 80 bytes    | sample layout unchanged; header reserved bytes 56–63 now carry `ios_host_offset_ns` (host-clock offset) |
 | 5       | 80 bytes    | **magnetometer generation**: `mag[xyz]` carries live data, `flags` bit 1 (MAG) is set, and the trailing float is reinterpreted as `mag_age_us`. These units have no frame-sync hardware, so `flags` bit 0 is clear and there is no `fsync_delay_us`. |
+| 6       | 80 bytes    | **mid-exposure generation**: sample layout unchanged from v5; the v6 change lives in the **video SEI / `.vts` v4** — the per-frame timestamp becomes exposure-centred and gains `exposure_us` + `readout_time_us`. The `.imu` itself is byte-identical to v5. |
 
-The byte tables below describe the current 80-byte layout (versions 3–5). v1/v2
+The byte tables below describe the current 80-byte layout (versions 3–6). v1/v2
 recordings have shorter samples (no `temp_c`/`quat`/`lin_accel`/trailing float);
 read their sample size from the version.
 
@@ -110,7 +116,7 @@ read their sample size from the version.
 | offset | size | type     | field            | meaning                                          |
 | ------ | ---- | -------- | ---------------- | ------------------------------------------------ |
 | 0      | 8    | char[8]  | magic            | ASCII `"TRIMU001"`                               |
-| 8      | 4    | uint32   | version          | 1–5 (see version history above; 5 current)       |
+| 8      | 4    | uint32   | version          | 1–6 (see version history above; 6 current)       |
 | 12     | 4    | uint32   | sample_rate_hz   | nominal IMU output data rate (e.g. 400 or 562, by unit) |
 | 16     | 2    | uint16   | accel_fs         | 0=±2 g, 1=±4 g, 2=±8 g, 3=±16 g                  |
 | 18     | 2    | uint16   | gyro_fs          | 0=±250, 1=±500, 2=±1000, 3=±2000 dps             |
@@ -176,13 +182,14 @@ monotonic clock that timestamps the IMU samples.
 | 1       | 12 bytes   | base: `frame_number` + `sof_timestamp_ns`                                                          |
 | 2       | 24 bytes   | + `venc_seq` + `venc_pts_us` (ties each frame to its encoded packet)                               |
 | 3       | 24 bytes   | per-frame entry unchanged from v2; the header's 16 reserved bytes now carry a multi-camera clock-sync block (below). v2 readers ignore those bytes and parse v3 entries unchanged. |
+| 4       | 36 bytes   | + `exposure_us` + `entry_flags` + `readout_time_us`. `sof_timestamp_ns` becomes the **mid-exposure** frame time when `entry_flags` bit 0 (`MID_EXPOSURE`) is set (else start-of-frame). `readout_time_us` is the rolling-shutter readout span; per-row delay = `readout_time_us / image_height` = the Kalibr `line_delay`. Written by mid-exposure (SEI v6) cameras. |
 
 ### Header (32 bytes)
 
 | offset | size | type     | field             | meaning                              |
 | ------ | ---- | -------- | ----------------- | ------------------------------------ |
 | 0      | 8    | char[8]  | magic             | ASCII `"TRIVTS01"`                   |
-| 8      | 4    | uint32   | version           | 1–3 (3 current)                      |
+| 8      | 4    | uint32   | version           | 1–4 (4 = mid-exposure cameras)       |
 | 12     | 4    | uint32   | frame_rate_milli  | configured fps × 1000 (e.g. 30000)   |
 | 16     | 16   | bytes    | reserved / sync   | zero in v1/v2; multi-camera clock-sync block in v3 (below) |
 
@@ -199,14 +206,17 @@ at recording start when the unit is part of a wireless-synced multi-camera group
 For a solo (un-synced) recording these bytes are zero and `sof_timestamp_ns` is
 already the correct per-camera clock.
 
-### Entry (12 bytes in v1; 24 bytes in v2/v3, one per encoded video frame)
+### Entry (12 bytes in v1; 24 bytes in v2/v3; 36 bytes in v4, one per encoded video frame)
 
 | offset | size | type     | field             | meaning                                                |
 | ------ | ---- | -------- | ----------------- | ------------------------------------------------------ |
 | 0      | 4    | uint32   | frame_number      | 0-based index into this MP4 file                       |
-| 4      | 8    | uint64   | sof_timestamp_ns  | start-of-frame monotonic ns (best clock for sync); 0 if unavailable |
-| 12     | 4    | uint32   | venc_seq          | encoder-internal sequence number (v2/v3 only)          |
-| 20     | 8    | uint64   | venc_pts_us       | encoder presentation timestamp in microseconds (v2/v3 only) |
+| 4      | 8    | uint64   | sof_timestamp_ns  | per-frame capture time, monotonic ns (best clock for sync); 0 if unavailable. **Mid-exposure** in v4 when `entry_flags` bit 0 is set; otherwise start-of-frame. |
+| 12     | 4    | uint32   | venc_seq          | encoder-internal sequence number (v2+)                 |
+| 16     | 8    | uint64   | venc_pts_us       | encoder presentation timestamp in microseconds (v2+). **Delivery timeline — do not use for IMU sync.** |
+| 24     | 4    | uint32   | exposure_us       | v4: applied integration time (valid when `entry_flags` bit 1) |
+| 28     | 4    | uint32   | entry_flags       | v4: bit 0 = `MID_EXPOSURE` (sof is exposure-centred), bit 1 = `EXPOSURE_VALID`, bit 2 = `READOUT_VALID` |
+| 32     | 4    | uint32   | readout_time_us   | v4: rolling-shutter readout span µs (valid when `entry_flags` bit 2); per-row delay = `readout_time_us / image_height` (Kalibr `line_delay`) |
 
 v1 entries stop after `sof_timestamp_ns` (12 bytes); `venc_seq`/`venc_pts_us`
 were added in v2.
