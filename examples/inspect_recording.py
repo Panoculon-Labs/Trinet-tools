@@ -84,6 +84,14 @@ def main():
         print(f"          version       = {vts.header.version}")
         print(f"          frame rate    = {vts.header.fps:.2f} fps (configured)")
         print(f"          frames        = {len(vts.frame_numbers)}")
+        if vts.is_mid_exposure:
+            row = "middle row (frame-centred)" if vts.is_frame_centered else "top row"
+            line = f"          timestamps    = mid-exposure, referenced to {row}"
+            if vts.readout_time_us is not None and len(vts.readout_time_us):
+                ro = int(vts.readout_time_us[0])
+                if ro > 0:
+                    line += f"; readout = {ro / 1000.0:.2f} ms"
+            print(line)
         print()
     else:
         print(f"  .vts  : (not found at {vts_path})")

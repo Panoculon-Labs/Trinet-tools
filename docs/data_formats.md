@@ -105,7 +105,7 @@ header `version`.
 | 3       | 80 bytes    | + trailing `fsync_delay_us`; header gains `flags` (bit 0 = frame-sync) and the 16-byte `device_id`  |
 | 4       | 80 bytes    | sample layout unchanged; header reserved bytes 56–63 now carry `ios_host_offset_ns` (host-clock offset) |
 | 5       | 80 bytes    | **magnetometer generation**: `mag[xyz]` carries live data, `flags` bit 1 (MAG) is set, and the trailing float is reinterpreted as `mag_age_us`. These units have no frame-sync hardware, so `flags` bit 0 is clear and there is no `fsync_delay_us`. |
-| 6       | 80 bytes    | **mid-exposure generation**: sample layout unchanged from v5; the v6 change lives in the **video SEI / `.vts` v4** — the per-frame timestamp becomes exposure-centred and gains `exposure_us` + `readout_time_us`. The `.imu` itself is byte-identical to v5. |
+| 6       | 80 bytes    | **mid-exposure generation**: sample layout unchanged from v5; the v6 change lives in the **video SEI / `.vts` v4** — the per-frame timestamp becomes exposure-centred (and, on current firmware, frame-centred to the middle row via the `FRAME_CENTERED` flag) and gains `exposure_us` + `readout_time_us`. The `.imu` itself is byte-identical to v5. |
 
 The byte tables below describe the current 80-byte layout (versions 3–6). v1/v2
 recordings have shorter samples (no `temp_c`/`quat`/`lin_accel`/trailing float);
@@ -182,7 +182,7 @@ monotonic clock that timestamps the IMU samples.
 | 1       | 12 bytes   | base: `frame_number` + `sof_timestamp_ns`                                                          |
 | 2       | 24 bytes   | + `venc_seq` + `venc_pts_us` (ties each frame to its encoded packet)                               |
 | 3       | 24 bytes   | per-frame entry unchanged from v2; the header's 16 reserved bytes now carry a multi-camera clock-sync block (below). v2 readers ignore those bytes and parse v3 entries unchanged. |
-| 4       | 36 bytes   | + `exposure_us` + `entry_flags` + `readout_time_us`. `sof_timestamp_ns` becomes the **mid-exposure** frame time when `entry_flags` bit 0 (`MID_EXPOSURE`) is set (else start-of-frame). `readout_time_us` is the rolling-shutter readout span; per-row delay = `readout_time_us / image_height` = the Kalibr `line_delay`. Written by mid-exposure (SEI v6) cameras. |
+| 4       | 36 bytes   | + `exposure_us` + `entry_flags` + `readout_time_us`. `sof_timestamp_ns` becomes the **mid-exposure** frame time when `entry_flags` bit 0 (`MID_EXPOSURE`) is set (else start-of-frame); bit 3 (`FRAME_CENTERED`) marks it as referencing the **middle** row of the rolling shutter (the frame's temporal centre) vs the **top** row when clear. `readout_time_us` is the rolling-shutter readout span; per-row delay = `readout_time_us / image_height` = the Kalibr `line_delay` (use the `FRAME_CENTERED`-selected reference row for per-row times). Written by mid-exposure (SEI v6) cameras. |
 
 ### Header (32 bytes)
 
@@ -211,21 +211,25 @@ already the correct per-camera clock.
 | offset | size | type     | field             | meaning                                                |
 | ------ | ---- | -------- | ----------------- | ------------------------------------------------------ |
 | 0      | 4    | uint32   | frame_number      | 0-based index into this MP4 file                       |
-| 4      | 8    | uint64   | sof_timestamp_ns  | per-frame capture time, monotonic ns (best clock for sync); 0 if unavailable. **Mid-exposure** in v4 when `entry_flags` bit 0 is set; otherwise start-of-frame. |
+| 4      | 8    | uint64   | sof_timestamp_ns  | per-frame capture time, monotonic ns (best clock for sync); 0 if unavailable. **Mid-exposure** in v4 when `entry_flags` bit 0 is set; otherwise start-of-frame. References the **middle row** when bit 3 (`FRAME_CENTERED`) is set, else the **top row**. |
 | 12     | 4    | uint32   | venc_seq          | encoder-internal sequence number (v2+)                 |
 | 16     | 8    | uint64   | venc_pts_us       | encoder presentation timestamp in microseconds (v2+). **Delivery timeline — do not use for IMU sync.** |
 | 24     | 4    | uint32   | exposure_us       | v4: applied integration time (valid when `entry_flags` bit 1) |
-| 28     | 4    | uint32   | entry_flags       | v4: bit 0 = `MID_EXPOSURE` (sof is exposure-centred), bit 1 = `EXPOSURE_VALID`, bit 2 = `READOUT_VALID` |
+| 28     | 4    | uint32   | entry_flags       | v4: bit 0 = `MID_EXPOSURE` (sof is exposure-centred in time), bit 1 = `EXPOSURE_VALID`, bit 2 = `READOUT_VALID`, **bit 3 = `FRAME_CENTERED`** (sof references the **middle** row of the rolling shutter — the frame's temporal centre, `SOF − T_exp/2 + T_readout/2`; when clear but MID_EXPOSURE set, it references the **top** row, `SOF − T_exp/2`) |
 | 32     | 4    | uint32   | readout_time_us   | v4: rolling-shutter readout span µs (valid when `entry_flags` bit 2); per-row delay = `readout_time_us / image_height` (Kalibr `line_delay`) |
 
 v1 entries stop after `sof_timestamp_ns` (12 bytes); `venc_seq`/`venc_pts_us`
 were added in v2.
 
 For inertial-to-video alignment, **prefer `sof_timestamp_ns`** (when nonzero):
-it is captured at the camera the moment the imager started reading out a frame,
-and matches the same clock as the IMU `timestamp_ns`. `venc_pts_us` is useful
-for matching the entry to a packet you read from the MP4, but is delayed by
-encoder pipeline latency relative to the actual capture instant.
+it is the camera's per-frame capture time on the same clock as the IMU
+`timestamp_ns`, and is the best single timestamp for the frame regardless of which
+row it references. For per-row (rolling-shutter) reconstruction, branch on the
+`FRAME_CENTERED` bit — the reference row is `image_height/2` when set, else `0`
+(top) — i.e. `t_row(r) = sof + (r − r_ref)·readout_time_us/image_height`; see
+`docs/imu_video_sync.md`. `venc_pts_us` is useful for matching the entry to a
+packet you read from the MP4, but is delayed by encoder pipeline latency relative
+to the actual capture instant.
 
 In chunked recordings, `frame_number` resets to 0 at the start of each part —
 so each part's `.vts` reads independently.

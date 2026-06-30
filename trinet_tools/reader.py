@@ -54,16 +54,23 @@ VTS_ENTRY_SIZE_V1 = 12
 # v2/v3: frame_number(uint32), sof_timestamp_ns(uint64), venc_seq(uint32), venc_pts_us(uint64)
 VTS_ENTRY_FMT_V2 = "<IQIQ"
 VTS_ENTRY_SIZE_V2 = 24
-# v4: appends exposure_us(uint32) + entry_flags(uint32). sof_timestamp_ns is the
-# mid-exposure frame time when TIMING_MID_EXPOSURE is set (else raw start-of-frame).
 # v4: appends exposure_us(uint32) + entry_flags(uint32) + readout_time_us(uint32).
-# readout_time_us = rolling-shutter readout span (µs); per-row delay =
-# readout_time_us / image_height (the Kalibr line_delay).
+# sof_timestamp_ns is the mid-exposure frame time when TIMING_MID_EXPOSURE is set
+# (else raw start-of-frame); when TIMING_FRAME_CENTERED is also set it references the
+# MIDDLE row of the rolling shutter (the frame's temporal centre), else the TOP row.
+# readout_time_us = rolling-shutter readout span (µs, first row → last row); per-row
+# delay = readout_time_us / image_height (the Kalibr line_delay). For per-row times
+# use VtsData.row_offset_s(), which branches on TIMING_FRAME_CENTERED.
 VTS_ENTRY_FMT_V4 = "<IQIQIII"
 VTS_ENTRY_SIZE_V4 = 36
 TIMING_MID_EXPOSURE = 0x01    # frame timestamp is exposure-center (else start-of-frame)
 TIMING_EXPOSURE_VALID = 0x02  # exposure_us is valid
 TIMING_READOUT_VALID = 0x04   # readout_time_us is valid
+TIMING_FRAME_CENTERED = 0x08  # sof references the MIDDLE row (frame temporal centre:
+                              # SOF − T_exp/2 + T_readout/2). When CLEAR but
+                              # MID_EXPOSURE is set, sof references the TOP row
+                              # (SOF − T_exp/2). Per-row reconstruction must branch on
+                              # this bit (r_ref = H/2 if set, else 0).
 
 ACCEL_FS_NAMES = {0: "±2 g", 1: "±4 g", 2: "±8 g", 3: "±16 g"}
 GYRO_FS_NAMES = {0: "±250 dps", 1: "±500 dps", 2: "±1000 dps", 3: "±2000 dps"}
@@ -220,7 +227,7 @@ class VtsData:
     venc_pts_us: Optional[np.ndarray] = None        # (M,) uint64 (v2+)
     exposure_us: Optional[np.ndarray] = None        # (M,) uint32 (v4+; 0 if unknown)
     timing_flags: Optional[np.ndarray] = None       # (M,) uint32 (v4+; TIMING_*)
-    readout_time_us: Optional[np.ndarray] = None     # (M,) uint32 (v5+; rolling-shutter span µs)
+    readout_time_us: Optional[np.ndarray] = None     # (M,) uint32 (v4+; rolling-shutter span µs)
 
     @property
     def is_mid_exposure(self) -> bool:
@@ -228,6 +235,56 @@ class VtsData:
         if self.timing_flags is None or len(self.timing_flags) == 0:
             return False
         return bool(int(self.timing_flags[0]) & TIMING_MID_EXPOSURE)
+
+    @property
+    def is_frame_centered(self) -> bool:
+        """True if ``sof_timestamps_ns`` references the MIDDLE row of the rolling
+        shutter — the frame's temporal centre, ``SOF − T_exp/2 + T_readout/2``
+        (firmware ≥ 2026-06-30). When False but :attr:`is_mid_exposure` is True,
+        ``sof`` references the TOP row (``SOF − T_exp/2``, older firmware).
+
+        Per-row reconstruction must branch on this (reference row ``H/2`` when
+        centred, else ``0``) — use :meth:`row_offset_s`. A single per-frame
+        timestamp (playback, simple cam-IMU alignment) should just use
+        ``sof_timestamps_ns`` directly: it is the best single time for the frame
+        regardless of this bit.
+        """
+        if self.timing_flags is None or len(self.timing_flags) == 0:
+            return False
+        return bool(int(self.timing_flags[0]) & TIMING_FRAME_CENTERED)
+
+    def line_delay_s(self, image_height: int) -> Optional[float]:
+        """Per-row readout delay in seconds (the Kalibr ``line_delay``), or None
+        if readout timing is unavailable: ``readout_time_us / image_height``
+        from the first valid frame.
+        """
+        if self.readout_time_us is None or len(self.readout_time_us) == 0:
+            return None
+        if image_height <= 0:
+            return None
+        valid = self.readout_time_us[self.readout_time_us > 0]
+        if len(valid) == 0:
+            return None
+        return float(valid[0]) * 1e-6 / float(image_height)
+
+    def row_offset_s(self, row: float, image_height: int) -> float:
+        """Seconds to ADD to ``sof_timestamps_ns`` to reach the exposure instant
+        of image ``row`` (0 = top row), accounting for rolling-shutter readout and
+        which row ``sof`` references::
+
+            offset = (row − r_ref) · line_delay
+            r_ref  = H/2  if is_frame_centered else 0   (top row)
+            line_delay = readout_time_us / image_height
+
+        For frame-centred timestamps the top row (row 0) is *earlier* than ``sof``
+        by ``readout/2`` and the bottom row *later* by ``readout/2``. Returns 0.0
+        when readout timing is unavailable (degrades to ``sof``).
+        """
+        ld = self.line_delay_s(image_height)
+        if ld is None:
+            return 0.0
+        r_ref = (image_height / 2.0) if self.is_frame_centered else 0.0
+        return (float(row) - r_ref) * ld
 
     @property
     def timestamps_s(self) -> np.ndarray:

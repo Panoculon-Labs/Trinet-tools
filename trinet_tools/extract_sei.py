@@ -169,7 +169,11 @@ def decode_trimu_sei(nal: bytes):
         if len(payload) < sample_base:
             continue
         # v6 per-frame timing block at payload[23:40]: mid-exposure frame time +
-        # applied exposure + rolling-shutter readout span. None for v<6 cameras.
+        # applied exposure + rolling-shutter readout span + timing flags. None for
+        # v<6 cameras. timing_flags (1 byte here; uint32 in the .vts) carries
+        # MID_EXPOSURE/EXPOSURE_VALID/READOUT_VALID/FRAME_CENTERED — FRAME_CENTERED
+        # (0x08) marks frame_sof_ts_ns as referencing the MIDDLE row. The byte is
+        # passed through verbatim into the .vts entry below, preserving every bit.
         timing = None
         if version >= 6:
             frame_sof_ts_ns = int.from_bytes(payload[23:31], "little")

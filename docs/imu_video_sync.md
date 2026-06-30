@@ -153,19 +153,26 @@ Aligning to `sof_timestamp_ns` removes the (large, variable) delivery latency, b
 instant the scene was actually integrated onto the sensor. For a rolling-shutter
 camera with a wide fisheye + IMU, that residual is:
 
-- **+ half the rolling-shutter readout** — `sof_timestamp_ns` is referenced to the
-  top row, but the bulk of the image (the centre row) is read out ~`readout/2`
-  later. With the example's 26.47 ms readout that's **~13.2 ms** — the dominant
-  term. (Because `sof` is already mid-*exposure*, the exposure time itself cancels
-  here and the offset does **not** drift with auto-exposure.)
+- **Rolling-shutter readout centre.** A frame is read out top row → bottom row over
+  `readout_time_us` (26.47 ms in the example), so different rows are exposed at
+  different instants; the natural single reference is the **middle row** (the frame's
+  temporal centre). Current firmware applies this on-device — `sof_timestamp_ns`
+  already references the middle row (the `TIMING_FRAME_CENTERED` flag, `0x08`, is
+  set), so **this ~`readout/2` ≈ 13.2 ms term is already removed** and does not
+  appear in the residual. *Older recordings* with `FRAME_CENTERED` **clear** reference
+  the **top row**, so for those the residual still contains the full **+~13.2 ms**.
+  (Either way `sof` is mid-*exposure*, so the exposure time cancels and the offset
+  does **not** drift with auto-exposure.)
 - **+ IMU group delay + pipeline latency** — the inertial sensor's internal
-  filtering delays its samples by ~1–2 ms, plus small constant ISP/transport
-  offsets (~3 ms total on the example).
+  filtering delays its samples by a few ms, plus small constant ISP/transport
+  offsets. This is the dominant residual for frame-centred recordings.
 
-These sum to a stable per-design constant — **−16.5 ms on the example recording**
-(typically −15 to −16.5 ms across units, spread < 1 ms).
-Kalibr's camera–IMU calibration estimates exactly this as **`timeshift_cam_imu`**,
-written into `calibration.json`:
+These sum to a stable per-design constant. Kalibr's camera–IMU calibration estimates
+exactly this as **`timeshift_cam_imu`**, written into `calibration.json`. **Its value
+differs between the two conventions** (it shrinks by ~`readout/2` once the firmware
+references the middle row), so do **not** reuse a `timeshift_cam_imu` measured on
+top-row recordings with frame-centred ones — recompute after a firmware update that
+changes `FRAME_CENTERED`. Example layout:
 
 ```json
 "extrinsics": {
@@ -202,13 +209,21 @@ captured at:
 ```
 t_row(r) = sof_timestamp_ns + timeshift + (r - r_ref) * line_delay
 line_delay = readout_time_us * 1000 / image_height        # ns per row
+r_ref      = image_height / 2   if TIMING_FRAME_CENTERED (0x08) is set
+           = 0  (top row)       otherwise (older firmware)
 ```
 
-where `r_ref` is the row the timestamp references (image centre when
-`TIMING_MID_EXPOSURE` is set). `readout_time_us` is a fixed property of the sensor
-mode (26.47 ms over 1080 rows = 24.5 µs/row on the example) and is available per-frame in
-v4+ `.vts`. Most consumers can ignore this and treat the frame as captured at
-`sof + timeshift`; VIO front-ends that model rolling shutter should use `line_delay`.
+`r_ref` is the row that `sof_timestamp_ns` references, and you **must** pick it from
+the `TIMING_FRAME_CENTERED` (`0x08`) flag — **not** from `TIMING_MID_EXPOSURE`:
+current firmware sets `FRAME_CENTERED`, so `sof` references the **middle** row
+(`r_ref = H/2`); older firmware leaves it clear and `sof` references the **top** row
+(`r_ref = 0`). (`TIMING_MID_EXPOSURE` only says `sof` is exposure-centred in *time*,
+not which *row* it references.) `readout_time_us` is a fixed property of the sensor
+mode (26.47 ms over 1080 rows = 24.5 µs/row on the example) and is available per-frame
+in v4+ `.vts`. `trinet_tools.reader.VtsData.row_offset_s(r, image_height)` implements
+the `(r − r_ref)·line_delay` term with the correct branch. Most consumers can ignore
+all of this and treat the frame as captured at `sof + timeshift`; VIO front-ends that
+model the rolling shutter should use `line_delay` with the flag-selected `r_ref`.
 
 ## Summary
 
