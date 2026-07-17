@@ -99,9 +99,11 @@ def load_take(prefix: Path, workdir: Path, calib_override: Path | None):
     return mp4_l, mp4_r, vts_l, vts_r, imu, calib
 
 
-def rect_maps_from_calib(calib: dict, size=(1920, 1080)):
+def rect_maps_from_calib(calib: dict, size=(1920, 1080), cy1_shift=0.0):
     """Fisheye rectification maps from a trinet stereo calibration dict
-    (cam0 = scene-LEFT). Returns (map_l, map_r, fx, baseline_m)."""
+    (cam0 = scene-LEFT). Returns (map_l, map_r, fx, baseline_m).
+    [cy1_shift] nudges the RIGHT camera's principal-point row — used by the
+    per-take auto-alignment below."""
     def KD(cam):
         it = cam["intrinsics"]
         K = np.array([[it["fx"], 0, it["cx"]], [0, it["fy"], it["cy"]], [0, 0, 1]])
@@ -110,6 +112,8 @@ def rect_maps_from_calib(calib: dict, size=(1920, 1080)):
 
     K0, D0 = KD(calib["cameras"][0])
     K1, D1 = KD(calib["cameras"][1])
+    K1 = K1.copy()
+    K1[1, 2] += cy1_shift
     T10 = np.array(calib["T_cam1_cam0"], dtype=np.float64)
     R, T = T10[:3, :3], T10[:3, 3]
     R1, R2, P1, P2, _ = cv2.fisheye.stereoRectify(
@@ -120,6 +124,37 @@ def rect_maps_from_calib(calib: dict, size=(1920, 1080)):
     fx = float(P2[0, 0])
     baseline = abs(float(P2[0, 3]) / fx)
     return m0, m1, fx, baseline
+
+
+def _rect_y_offset(mp4_l, mp4_r, pairs, m0, m1, samples=5):
+    """Median vertical parallax of ORB matches across [samples] rectified
+    pairs spread over the take. ~0 for a healthy calibration."""
+    orb = cv2.ORB_create(2000)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    caps = (cv2.VideoCapture(str(mp4_l)), cv2.VideoCapture(str(mp4_r)))
+    dys = []
+    for k in np.linspace(0.1, 0.9, samples):
+        il, ir, _ = pairs[int(k * (len(pairs) - 1))]
+        caps[0].set(cv2.CAP_PROP_POS_FRAMES, il)
+        caps[1].set(cv2.CAP_PROP_POS_FRAMES, ir)
+        okl, L = caps[0].read()
+        okr, R = caps[1].read()
+        if not (okl and okr):
+            continue
+        rl = cv2.remap(cv2.cvtColor(L, cv2.COLOR_BGR2GRAY), m0[0], m0[1], 1)
+        rr = cv2.remap(cv2.cvtColor(R, cv2.COLOR_BGR2GRAY), m1[0], m1[1], 1)
+        kL, dL = orb.detectAndCompute(rl, None)
+        kR, dR = orb.detectAndCompute(rr, None)
+        if dL is None or dR is None:
+            continue
+        for m in bf.match(dL, dR):
+            dx = kL[m.queryIdx].pt[0] - kR[m.trainIdx].pt[0]
+            dy = kL[m.queryIdx].pt[1] - kR[m.trainIdx].pt[1]
+            if 0 < dx < 300 and abs(dy) < 60:
+                dys.append(dy)
+    for c in caps:
+        c.release()
+    return float(np.median(dys)) if len(dys) > 100 else None
 
 
 def pair_frames(vts_l, vts_r, max_skew_frac: float = 0.5):
@@ -281,6 +316,8 @@ def main():
                     help="scrolling gyro|accel strip under the depth panels")
     ap.add_argument("--match-scale", type=float, default=1.0)
     ap.add_argument("--ema", type=float, default=0.0)
+    ap.add_argument("--no-auto-align", action="store_true",
+                    help="disable the per-take vertical auto-alignment")
     args = ap.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="trinet_depth_") as td:
@@ -293,6 +330,29 @@ def main():
     m0, m1, fx, baseline = rect_maps_from_calib(calib)
     print(f"baseline {baseline*1000:.1f} mm (from "
           f"{'--calibration' if args.calibration else 'embedded calibration'})")
+
+    if not args.no_auto_align:
+        # Per-take vertical auto-alignment. Stereo housings settle over time
+        # and temperature; a residual vertical offset between the rectified
+        # eyes silently ruins row-search stereo matching. Measure it from the
+        # take itself and absorb it into the right camera's principal point
+        # (two refinement rounds; pure epipolar correction, depth scale is
+        # untouched).
+        shift = 0.0
+        for _ in range(3):
+            dy = _rect_y_offset(Path(f"{args.take}_L.mp4"),
+                                Path(f"{args.take}_R.mp4"), pairs, m0, m1)
+            if dy is None or abs(dy) < 0.3:
+                break
+            # dy = yL - yR of matched features; a negative dy means the right
+            # image content sits LOWER — raising cy1 lifts it. (Sign verified
+            # empirically; the wrong direction doubles the residual.)
+            shift -= dy
+            m0, m1, fx, baseline = rect_maps_from_calib(calib, cy1_shift=shift)
+        if abs(shift) > 0.5:
+            print(f"[auto-align] residual vertical offset {shift:+.1f} px "
+                  f"absorbed into rectification (stereo mount has moved "
+                  f"since calibration — consider recalibrating)")
 
     nd = (args.num_disp + 15) // 16 * 16
     sgbm = cv2.StereoSGBM_create(
