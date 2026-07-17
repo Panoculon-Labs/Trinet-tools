@@ -361,6 +361,31 @@ so `.imu` reconstruction is IHDR + rows rebuilt from the columns; `TFRM` and
 - **`tmfc`** — the camera's stored calibration blob, verbatim (the same binary
   the calibration pipeline pushes to the device; magic `TBLC`).
 
+## Calibration blob (TBLC)
+
+The binary calibration blob the camera stores, serves to hosts, and embeds in
+every recording's `tmfc` box. Little-endian, `TBLC` magic, trailing CRC-32
+(zlib polynomial) over everything before it. Two layouts share the magic:
+
+- **v1 — 200 bytes, one camera**: header (magic, version, flags, 16-byte
+  device binding), image size + projection model + `fx fy cx cy` + up to five
+  distortion coefficients, camera<-IMU rotation/translation, IMU time offset,
+  IMU noise densities / random walks, calibration-time biases, quality
+  residuals.
+- **v2 — 300 bytes, stereo**: same header, then two 52-byte camera blocks
+  (cam0 = scene-**left** `_L` eye: size, model, intrinsics, distortion,
+  per-camera IMU time offset, reprojection RMS), then `T_cam0_imu`, the stereo
+  extrinsic `T_cam1_cam0` (translation = baseline), and one shared IMU block.
+
+Flags mark which sections are populated (device binding, extrinsics, time
+offset, biases, quality) and the time-offset sign convention
+(`t_imu = t_cam + timeshift_cam_imu_s`). The reference codec — including the
+exact struct layouts — is [`trinet_tools/calib_blob.py`](../trinet_tools/calib_blob.py):
+`unpack()` any blob to JSON, or `pack`/`pack_v2` a `calibration.json` into a
+blob. The end-to-end notebook
+[`examples/tmf_metadata_and_calibration.ipynb`](../examples/tmf_metadata_and_calibration.ipynb)
+decodes the blob straight out of an MP4 and undistorts a frame with it.
+
 ## `.json` recording-meta sidecar
 
 A small, human-readable `<base>.json` sits next to every recording. It identifies

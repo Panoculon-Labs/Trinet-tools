@@ -86,6 +86,26 @@ one timeline — render it with
 
 ## Quickstart
 
+### End-to-end notebook: embedded metadata + calibration from a single MP4
+
+Every recording embeds its IMU, per-frame timing, thermal telemetry, metadata
+JSON and the camera's calibration **inside the MP4 itself** (the TMF track).
+The notebook
+[`examples/tmf_metadata_and_calibration.ipynb`](examples/tmf_metadata_and_calibration.ipynb)
+walks the whole path on a real stereo recording shipped in this repo
+(`examples/data/take0002_L.mp4`): read the metadata, plot the IMU and frame
+timing, decode the embedded calibration blob and undistort a frame with it.
+Quick taste:
+
+```python
+from trinet_tools.tmf import read_tmf
+from trinet_tools import calib_blob
+
+rec = read_tmf("examples/data/take0002_L.mp4")
+print(rec.meta["drops"])                 # camera's own frame-drop summary
+calib = calib_blob.unpack(rec.calib_blob)  # intrinsics/extrinsics/IMU noise
+```
+
 ### Parse a recording in Python
 
 ```python
