@@ -38,6 +38,11 @@ docker run --rm --entrypoint /bin/bash \
     source /catkin_ws/devel/setup.bash
     roscore >/tmp/roscore.log 2>&1 &
     sleep 2
+    # record the sparse landmark clouds the estimator publishes — the
+    # trajectory alone isn't a map
+    rosbag record -O /data/ov_out/landmarks.bag \
+      /ov_msckf/points_slam /ov_msckf/points_msckf __name:=lmrec \
+      >/tmp/lmrec.log 2>&1 &
     # serial.launch's path_gt default does \$(find ov_data), which roslaunch
     # resolves at parse time even when the arg is overridden — and ov_data
     # isn't shipped. Neutralize the default in a patched copy.
@@ -51,6 +56,24 @@ docker run --rm --entrypoint /bin/bash \
       dosave:=true path_est:=/data/ov_out/traj_est.txt \
       dolivetraj:=false path_gt:=/dev/null \
       dataset:=trinet verbosity:=INFO
+    rosnode kill /lmrec >/dev/null 2>&1 || true
+    sleep 1
+    # bag -> flat csv of landmark positions (last observation per topic kept
+    # by the consumer; we just dump everything)
+    python3 - <<'PY'
+import rosbag, csv
+from sensor_msgs import point_cloud2
+out = csv.writer(open('/data/ov_out/landmarks.csv', 'w'))
+out.writerow(['topic', 't', 'x', 'y', 'z'])
+try:
+    bag = rosbag.Bag('/data/ov_out/landmarks.bag')
+    for topic, msg, t in bag.read_messages():
+        for pt in point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True):
+            out.writerow([topic, f'{t.to_sec():.3f}',
+                          f'{pt[0]:.4f}', f'{pt[1]:.4f}', f'{pt[2]:.4f}'])
+except Exception as e:
+    print('landmark export failed:', e)
+PY
   "
 
 echo

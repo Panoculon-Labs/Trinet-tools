@@ -175,6 +175,12 @@ def main():
     ap.add_argument("--calibration", type=Path, default=None)
     ap.add_argument("--noise-inflation", type=float, default=5.0)
     ap.add_argument("--imu-rate", type=float, default=400.0)
+    ap.add_argument("--auto-align", action="store_true",
+                    help="measure the take's residual vertical stereo offset "
+                         "(trinet_tools.stereo_align) and fold it into cam1's "
+                         "principal point in the generated camchain — use when "
+                         "the mount may have moved since calibration. SOURCE "
+                         "must be the take's _L.mp4 with its _R sibling.")
     args = ap.parse_args()
 
     calib = None
@@ -190,6 +196,37 @@ def main():
             calib = calib_blob.unpack(rec.calib_blob)
     if not calib or "cameras" not in calib:
         sys.exit("no stereo calibration found (embedded or via --calibration)")
+
+    if args.auto_align:
+        from trinet_tools.reader import read_vts
+        from trinet_tools.stereo_align import auto_align
+        from trinet_tools.tmf import read_tmf as _read_tmf
+        import tempfile
+        src = Path(args.source)
+        mp4_r = Path(str(src).replace("_L.mp4", "_R.mp4"))
+        with tempfile.TemporaryDirectory() as td:
+            def vts_for(p, eye):
+                sc = Path(str(p).replace(".mp4", ".vts"))
+                if sc.exists():
+                    return read_vts(str(sc))
+                q = Path(td) / f"{eye}.vts"
+                q.write_bytes(_read_tmf(p).vts_bytes())
+                return read_vts(str(q))
+            vl, vr = vts_for(src, "L"), vts_for(mp4_r, "R")
+        tl = vl.sof_timestamps_ns.astype(np.int64)
+        tr = vr.sof_timestamps_ns.astype(np.int64)
+        gate = int(np.median(np.diff(tl)) * 0.5)
+        pairs, j = [], 0
+        for i, t in enumerate(tl):
+            while j + 1 < len(tr) and abs(int(tr[j+1])-int(t)) < abs(int(tr[j])-int(t)):
+                j += 1
+            if abs(int(tr[j]) - int(t)) <= gate:
+                pairs.append((i, j, int(t)))
+        _, shift = auto_align(src, mp4_r, pairs, calib)
+        if abs(shift) > 0.5:
+            print(f"[auto-align] folding {shift:+.1f} px vertical offset into "
+                  f"cam1 cy (mount moved since calibration)")
+            calib["cameras"][1]["intrinsics"]["cy"] += shift
 
     args.out.mkdir(parents=True, exist_ok=True)
 
