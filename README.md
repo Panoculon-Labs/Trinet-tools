@@ -202,6 +202,32 @@ upside-down — common for wrist units — flip its panel with `--rotate180`, e.
 python examples/inspect_recording.py path/to/recording.imu
 ```
 
+## Stereo recordings: depth, motion HUD, and SLAM
+
+Stereo takes (`<take>_L.mp4` + `<take>_R.mp4`) are self-contained: frame
+pairing, IMU, and the camera's calibration are read from the files themselves.
+
+```bash
+# Metric stereo depth video: rectified L|R, SGBM depth (add WLS smoothing
+# with --wls if opencv-contrib-python is installed), optional gyro/accel strip.
+python3 scripts/stereo_depth_video.py captures/take0002 out_depth.mp4 --wls --imu --ema 0.5
+
+# Motion HUD: side-by-side playback with a reference grid, live rotation
+# rates, and the predicted rolling-shutter shear per frame.
+python3 scripts/stereo_motion_hud.py captures/take0002 out_hud.mp4 --start-s 10 --end-s 25
+
+# Stereo-inertial odometry (OpenVINS) on a take, fully containerized:
+docker build -t trinet-openvins:latest scripts/openvins-docker/
+python3 scripts/make_openvins_config.py captures/take0002_L.mp4 WORK/ov_config
+#   (bag layout: WORK/full/{cam0,cam1,imu0.csv} -> kalibr_bagcreater, see script help)
+./scripts/run_openvins.sh WORK
+python3 scripts/plot_trajectory.py WORK/ov_out/traj_est.txt
+```
+
+`make_openvins_config.py` converts the embedded calibration into the three
+config files OpenVINS expects (including the `T_imu_cam` inversion and IMU
+noise inflation), so the recording carries everything a VIO run needs.
+
 ## IMU ↔ video synchronization
 
 To align the IMU with video to sub-millisecond accuracy from a USB-streamed
