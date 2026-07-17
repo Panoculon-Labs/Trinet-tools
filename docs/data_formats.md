@@ -17,10 +17,19 @@ times — they reset to 0 when the camera powers up).
 
 Every recording is a small set of files that share one **base name**:
 
-    Trinet/<base>.mp4     # H.264 video
+    Trinet/<base>.mp4     # video (see below for the embedded-metadata track)
     Trinet/<base>.imu     # inertial samples (accel/gyro/mag)
     Trinet/<base>.vts     # per-frame video timestamps (+ cross-camera sync offset)
+    Trinet/<base>.tel     # 1 Hz device thermal telemetry (newer firmware)
     Trinet/<base>.json    # recording-meta sidecar (session / role / clock sync — see below)
+
+> **Self-contained MP4s:** cameras running current firmware also embed a copy
+> of the `.imu`, `.vts` and `.tel` content — plus the device calibration and a
+> recording summary — *inside* the MP4 itself, as a timed metadata track and
+> user-data boxes (the **TMF** section below). Sharing just the `.mp4` is then
+> enough: `python3 -m trinet_tools.tmf extract take.mp4` reconstructs
+> byte-identical sidecars. The separate sidecar files are still written for
+> compatibility and crash safety.
 
 The base name tells you how the recording was made:
 
@@ -234,6 +243,124 @@ to the actual capture instant.
 In chunked recordings, `frame_number` resets to 0 at the start of each part —
 so each part's `.vts` reads independently.
 
+## `.tel` file format (TRTEL01)
+
+Device thermal telemetry: the camera samples its internal temperature once per
+second for the whole recording session (including the brief warm-up before the
+first saved video frame). Useful for correlating image quality or throttling
+questions with device temperature. A 32-byte header followed by 24-byte records.
+
+### Header (32 bytes)
+
+| offset | size | type    | field        | meaning                              |
+| ------ | ---- | ------- | ------------ | ------------------------------------ |
+| 0      | 8    | char[8] | magic        | ASCII `"TRTEL01"` (NUL-padded)       |
+| 8      | 4    | uint32  | version      | 1                                    |
+| 12     | 4    | uint32  | header_size  | 32                                   |
+| 16     | 4    | uint32  | record_count | number of records (also derivable from file size) |
+| 24     | 8    | bytes   | device_id    | first 8 bytes of the camera's device ID (zero if unknown) |
+
+### Record (24 bytes, repeated)
+
+| offset | size | type   | field           | meaning                                       |
+| ------ | ---- | ------ | --------------- | --------------------------------------------- |
+| 0      | 8    | uint64 | timestamp_ns    | monotonic ns (same clock as `.imu`/`.vts`)    |
+| 8      | 4    | int32  | temp_milli_c    | device temperature, milli-°C                  |
+| 12     | 4    | uint32 | cpu_freq_khz    | device CPU frequency at sample time           |
+| 16     | 4    | uint32 | bitrate_kbps    | configured video bitrate                      |
+| 20     | 2    | uint16 | framerate_fps   | configured frame rate                         |
+| 22     | 1    | uint8  | thermal_state   | device thermal-management state (0 = nominal) |
+| 23     | 1    | uint8  | led_state       | status-LED state code (0 = default)           |
+
+## Embedded metadata track (TMF)
+
+Recordings from current firmware are **self-contained**: the MP4 carries a
+timed metadata track — sample entry FOURCC **`tmfd`**, handler type `meta`,
+handler name `Trinet TMF` — plus two `moov/udta` boxes. Players ignore both;
+`ffprobe` shows the track as a `data` stream. Anything that re-encodes or
+re-muxes the file will drop them (the same limitation GoPro's GPMF has); the
+sidecar files are the recovery path.
+
+`python3 -m trinet_tools.tmf info take.mp4` prints a summary;
+`… tmf extract take.mp4 [--out DIR]` reconstructs byte-identical `.imu`,
+`.vts` and `.tel` sidecars plus the metadata JSON and calibration blob.
+
+### KLV grammar
+
+Each track sample is one `DEVC` payload covering ~1 s of data, built from KLV
+items:
+
+    key[4]        FOURCC (ASCII)
+    type          u8   'c' ascii, 'B' opaque struct, 'f' float32, 'L' u32,
+                       'Q' u64, 0 = container of nested KLV items
+    struct_size   u8   bytes per element
+    repeat        u16  LITTLE-endian element count
+    payload       struct_size × repeat bytes, zero-padded to a 4-byte boundary
+
+All payload scalars are **little-endian**. Containers use `type=0,
+struct_size=4`, `repeat` = payload length in 4-byte words.
+
+### Items inside `DEVC`
+
+| key | type | content |
+|---|---|---|
+| `DVNM` | c | `"Trinet"` |
+| `DVID` | L | 1 |
+| `TICK` | Q | chunk start timestamp (monotonic ns) |
+| `IHDR` | B×64 | raw `.imu` file header (first chunk only) |
+| `VHDR` | B×32 | raw `.vts` file header (first chunk only) |
+| `THDR` | B×32 | raw `.tel` file header (first chunk only) |
+| `STRM` | 0 | one per data stream, see below |
+
+Each `STRM` holds `STNM` (name), optional `SIUN` (SI unit), `STMP` (Q — first
+sample timestamp in the chunk, ns), then one data item:
+
+| key | type×size | content | rate |
+|---|---|---|---|
+| `TSNS` | Q×8 | per-sample timestamps (ns) | IMU rate |
+| `ACCL` | f×12 | accel xyz (m/s², incl. gravity) | IMU rate |
+| `GYRO` | f×12 | gyro xyz (rad/s) | IMU rate |
+| `MAGN` | f×12 | mag xyz (µT) | IMU rate |
+| `TMPC` | f×4 | IMU temperature (°C) | IMU rate |
+| `QUAT` | f×16 | orientation xyzw (zeros on current firmware) | IMU rate |
+| `LACC` | f×12 | linear accel (zeros on current firmware) | IMU rate |
+| `MAGA` | f×4 | mag age µs (`.imu` v5+) | IMU rate |
+| `FSYN` | f×4 | frame-sync delay µs (`.imu` v3/v4) | IMU rate |
+| `TFRM` | B×24 or B×36 | raw `.vts` entries (see the `.vts` tables above) | per frame |
+| `TSOC` | B×24 | raw `.tel` records (see the `.tel` table above) | 1 Hz |
+
+The IMU streams are exactly the columns of the 80-byte `.imu` sample record,
+so `.imu` reconstruction is IHDR + rows rebuilt from the columns; `TFRM` and
+`TSOC` are verbatim sidecar records.
+
+### `moov/udta` boxes
+
+- **`tmfm`** — recording metadata, UTF-8 JSON:
+
+```json
+{
+  "tmf_schema": 1,
+  "device_id": "hex32 (absent if unknown)",
+  "fw_version": "…", "hw_generation": "…",
+  "eye": "L | R (stereo cameras)",
+  "pair_file": "sibling eye's mp4 name (stereo)",
+  "codec": "h264 | h265",
+  "imu_version": 5, "imu_rate_hz": 400, "vts_version": 4,
+  "sync": {"offset_ns": 0, "skew_ppb": 0, "quality_us": 0, "flags": 0},
+  "drops": {"nominal_ms": 33.4, "expected": 900, "recorded": 900,
+             "gap_count": 0, "gaps": [{"after_frame": 0, "ms": 0.0}]},
+  "thermal": {"min_c": 40.1, "max_c": 55.2, "samples": 30}
+}
+```
+
+  `drops` is the camera's own frame-continuity summary for the take (gaps
+  detected from per-frame timestamps, list capped at 64); `sync` mirrors the
+  `.vts` v3 multi-camera clock block; `thermal` is the `.tel` min/max envelope.
+  Keys are omitted when unknown; new keys may be added without a schema bump.
+
+- **`tmfc`** — the camera's stored calibration blob, verbatim (the same binary
+  the calibration pipeline pushes to the device; magic `TBLC`).
+
 ## `.json` recording-meta sidecar
 
 A small, human-readable `<base>.json` sits next to every recording. It identifies
@@ -304,11 +431,22 @@ After the UUID the payload continues with a small header and then the samples:
 | offset | size | type   | field       | meaning                                                            |
 | ------ | ---- | ------ | ----------- | ------------------------------------------------------------------ |
 | 0      | 16   | bytes  | uuid        | the TRINETIMUSEI UUID above                                        |
-| 16     | 1    | uint8  | version     | sample-format version (matches the `.imu` `version`: 5 on current units) |
+| 16     | 1    | uint8  | version     | sample-format version (matches the `.imu` `version`; 6 on current units) |
 | 17     | 2    | uint16 | num_samples | number of IMU sample records that follow                           |
 | 19     | 2    | uint16 | accel_fs    | accelerometer full-scale code (same codes as the `.imu` header)    |
 | 21     | 2    | uint16 | gyro_fs     | gyroscope full-scale code                                          |
-| 23     | …    | —      | samples     | `num_samples` × 80-byte records, identical layout to the `.imu` body |
+| 23     | …    | —      | samples     | version ≤ 5: `num_samples` × 80-byte records, identical layout to the `.imu` body |
+
+**Version 6** inserts a 17-byte per-frame timing block between `gyro_fs` and
+the samples (the SEI analogue of the `.vts` v4 entry):
+
+| offset | size | type   | field            | meaning                                             |
+| ------ | ---- | ------ | ---------------- | --------------------------------------------------- |
+| 23     | 8    | uint64 | frame_sof_ts_ns  | this frame's capture timestamp (see `.vts` v4 `sof_timestamp_ns` semantics) |
+| 31     | 4    | uint32 | exposure_us      | applied integration time (0 if unknown)             |
+| 35     | 1    | uint8  | timing_flags     | same bits as `.vts` v4 `entry_flags`                |
+| 36     | 4    | uint32 | readout_time_us  | rolling-shutter readout span (0 if unknown)         |
+| 40     | …    | —      | samples          | `num_samples` × 80-byte records (v5 layout)         |
 
 Each frame carries the samples acquired since the previous frame's NAL. The
 payload `version` tells you how to read the trailing float — `fsync_delay_us` for
