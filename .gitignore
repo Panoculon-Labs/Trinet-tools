@@ -21,4 +21,10 @@ out/
 *.vts
 *.h264
 
+# Delivery ZIPs produced by scripts/ingest_sd_card.py. These contain real
+# recordings -- never commit them.
+deliveries/
+test-av/
+*.zip
+
 .claude/
