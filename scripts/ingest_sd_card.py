@@ -29,6 +29,7 @@ all (unless you explicitly ask for --repair).
 """
 
 import argparse
+import base64
 import datetime as _dt
 import json
 import math
@@ -441,6 +442,356 @@ def _descend(f, start, end, path):
         if typ == path[0]:
             for r in _descend(f, st, en, path[1:]):
                 yield r
+
+
+# --------------------------------------------------------------------------- #
+# Per-sample / per-frame iteration (used to build the MCAP)
+# --------------------------------------------------------------------------- #
+def iter_imu_samples(path):
+    """Yield (timestamp_ns, (ax,ay,az), (gx,gy,gz), (mx,my,mz)) per sample."""
+    size = os.path.getsize(path)
+    if size < IMU_HEADER:
+        return
+    with open(path, "rb") as f:
+        h = f.read(IMU_HEADER)
+        if h[:8] != IMU_MAGIC:
+            return
+        ssize = IMU_SAMPLE_SIZE.get(_u32(h, 8))
+        if not ssize or ssize < 44:
+            return
+        n = (size - IMU_HEADER) // ssize
+        f.seek(IMU_HEADER)
+        for _ in range(n):
+            rec = f.read(ssize)
+            if len(rec) < ssize:
+                break
+            ts = _u64(rec, 0)
+            ax, ay, az = struct.unpack_from("<3f", rec, 8)
+            gx, gy, gz = struct.unpack_from("<3f", rec, 20)
+            mx, my, mz = struct.unpack_from("<3f", rec, 32)
+            yield ts, (ax, ay, az), (gx, gy, gz), (mx, my, mz)
+
+
+def iter_vts_frames(path):
+    """Yield sof_timestamp_ns for each frame entry (0 if unavailable)."""
+    size = os.path.getsize(path)
+    if size < VTS_HEADER:
+        return
+    with open(path, "rb") as f:
+        h = f.read(VTS_HEADER)
+        if h[:8] != VTS_MAGIC:
+            return
+        esize = VTS_ENTRY_SIZE.get(_u32(h, 8))
+        if not esize:
+            return
+        n = (size - VTS_HEADER) // esize
+        body = f.read(n * esize)
+    for i in range(n):
+        yield _u64(body, i * esize + 4)
+
+
+def read_avcc(path):
+    """SPS/PPS NAL lists and NAL length size from the MP4's avcC record."""
+    size = _safe_size(path)
+    try:
+        with open(path, "rb") as f:
+            moov = next((r for t, *r in
+                         ((t, s, e) for t, s, e in _boxes(f, 0, size))
+                         if t == b"moov"), None)
+            if not moov:
+                return None
+            for st, en in _descend(f, moov[0], moov[1],
+                                   (b"trak", b"mdia", b"minf",
+                                    b"stbl", b"stsd")):
+                f.seek(st + 8)
+                entry = f.read(min(400, en - st - 8))
+                idx = entry.find(b"avcC")
+                if idx < 0:
+                    continue
+                av = entry[idx + 4:]
+                nal_len = (av[4] & 3) + 1
+                o = 5
+                nsps = av[o] & 0x1f
+                o += 1
+                sps = []
+                for _ in range(nsps):
+                    L = _u16be(av, o)
+                    o += 2
+                    sps.append(av[o:o + L])
+                    o += L
+                npps = av[o]
+                o += 1
+                pps = []
+                for _ in range(npps):
+                    L = _u16be(av, o)
+                    o += 2
+                    pps.append(av[o:o + L])
+                    o += L
+                return {"nal_len": nal_len, "sps": sps, "pps": pps}
+    except (OSError, IndexError, struct.error):
+        return None
+    return None
+
+
+_ANNEXB_START = b"\x00\x00\x00\x01"
+
+
+def iter_h264_access_units(paths, avcc):
+    """Yield (annexb_bytes, is_keyframe) per frame, in decode order.
+
+    Trinet frames are single-slice with no B-frames, so decode order equals
+    display order and each VCL NAL (type 1/5) delimits one frame. SPS/PPS are
+    prepended to every IDR so a decoder can start on any keyframe.
+    """
+    if not avcc:
+        return
+    nal_len = avcc["nal_len"]
+    param_sets = b"".join(_ANNEXB_START + n for n in avcc["sps"] + avcc["pps"])
+    pending = []                       # non-VCL NALs seen since last frame
+    for p in paths:
+        psize = _safe_size(p)
+        try:
+            with open(p, "rb") as f:
+                for t, st, en in _boxes(f, 0, psize):
+                    if t != b"mdat":
+                        continue
+                    o = st
+                    while o + nal_len <= en:
+                        f.seek(o)
+                        lb = f.read(nal_len)
+                        if len(lb) < nal_len:
+                            break
+                        L = int.from_bytes(lb, "big")
+                        if L == 0 or o + nal_len + L > en:
+                            break
+                        f.seek(o + nal_len)
+                        nal = f.read(L)
+                        o += nal_len + L
+                        if not nal:
+                            continue
+                        ntype = nal[0] & 0x1f
+                        if ntype in (1, 5):            # VCL slice = one frame
+                            idr = ntype == 5
+                            au = bytearray()
+                            if idr:
+                                au += param_sets
+                            for nn in pending:
+                                au += _ANNEXB_START + nn
+                            au += _ANNEXB_START + nal
+                            pending = []
+                            yield bytes(au), idr
+                        elif ntype in (7, 8, 9, 6):    # SPS/PPS/AUD/SEI
+                            pending.append(nal)
+        except OSError:
+            pending = []
+            continue
+
+
+# --------------------------------------------------------------------------- #
+# MCAP writer (self-contained; no external library)
+#
+# MCAP is a typed-record container: an 8-byte magic, a Header record, then
+# Schema / Channel / Message / Attachment / Metadata records, a DataEnd, and a
+# Footer, closed by the magic again. This writes an un-chunked, un-indexed file
+# (a valid MCAP per the spec -- the summary section is optional); readers build
+# their own index on load. Format reference: https://mcap.dev/spec
+# --------------------------------------------------------------------------- #
+MCAP_MAGIC = b"\x89MCAP0\r\n"
+
+
+class McapWriter:
+    def __init__(self, fileobj):
+        self.f = fileobj
+        self.f.write(MCAP_MAGIC)
+        self._next_schema = 1
+        self._next_channel = 0
+        self._msg_count = 0
+
+    # -- record framing --------------------------------------------------- #
+    @staticmethod
+    def _str(s):
+        b = s.encode("utf-8")
+        return struct.pack("<I", len(b)) + b
+
+    @staticmethod
+    def _map(d):
+        body = b"".join(McapWriter._str(k) + McapWriter._str(v)
+                        for k, v in d.items())
+        return struct.pack("<I", len(body)) + body
+
+    def _record(self, op, body):
+        self.f.write(struct.pack("<BQ", op, len(body)))
+        self.f.write(body)
+
+    # -- records ---------------------------------------------------------- #
+    def header(self, profile, library):
+        self._record(0x01, self._str(profile) + self._str(library))
+
+    def add_schema(self, name, encoding, data):
+        sid = self._next_schema
+        self._next_schema += 1
+        body = (struct.pack("<H", sid) + self._str(name) + self._str(encoding)
+                + struct.pack("<I", len(data)) + data)
+        self._record(0x03, body)
+        return sid
+
+    def add_channel(self, schema_id, topic, message_encoding, metadata=None):
+        cid = self._next_channel
+        self._next_channel += 1
+        body = (struct.pack("<HH", cid, schema_id) + self._str(topic)
+                + self._str(message_encoding) + self._map(metadata or {}))
+        self._record(0x04, body)
+        return cid
+
+    def message(self, channel_id, log_time, data, sequence=0, publish_time=None):
+        if publish_time is None:
+            publish_time = log_time
+        head = struct.pack("<HIQQ", channel_id, sequence, log_time, publish_time)
+        self._record(0x05, head + data)
+        self._msg_count += 1
+
+    def attachment(self, name, media_type, data, log_time=0):
+        body = (struct.pack("<QQ", log_time, log_time) + self._str(name)
+                + self._str(media_type) + struct.pack("<Q", len(data)) + data
+                + struct.pack("<I", 0))       # crc 0 = not computed
+        self._record(0x09, body)
+
+    def metadata(self, name, entries):
+        self._record(0x0C, self._str(name) + self._map(entries))
+
+    def finish(self):
+        self._record(0x0F, struct.pack("<I", 0))            # DataEnd, crc 0
+        self._record(0x02, struct.pack("<QQI", 0, 0, 0))    # Footer, no summary
+        self.f.write(MCAP_MAGIC)
+
+
+# JSON Schemas embedded in the MCAP so it is self-describing.
+_IMU_SCHEMA = json.dumps({
+    "type": "object",
+    "title": "trinet.Imu",
+    "properties": {
+        "timestamp": {"type": "object", "properties": {
+            "sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+        "linear_acceleration": {"type": "object", "properties": {
+            "x": {"type": "number"}, "y": {"type": "number"},
+            "z": {"type": "number"}}, "description": "m/s^2, gravity included"},
+        "angular_velocity": {"type": "object", "properties": {
+            "x": {"type": "number"}, "y": {"type": "number"},
+            "z": {"type": "number"}}, "description": "rad/s"},
+    },
+}).encode("utf-8")
+
+_VIDEO_SCHEMA = json.dumps({
+    "type": "object",
+    "title": "foxglove.CompressedVideo",
+    "properties": {
+        "timestamp": {"type": "object", "properties": {
+            "sec": {"type": "integer"}, "nsec": {"type": "integer"}}},
+        "frame_id": {"type": "string"},
+        "data": {"type": "string", "contentEncoding": "base64"},
+        "format": {"type": "string"},
+    },
+}).encode("utf-8")
+
+
+def _ns_time(ns):
+    return {"sec": ns // 1_000_000_000, "nsec": ns % 1_000_000_000}
+
+
+def write_mcap(path, clip, meta, calibration_path, log):
+    """Write one clip as an MCAP: /imu messages, /camera CompressedVideo
+    messages, a metadata record, and the metadata / calibration attachments."""
+    imu_paths = clip.sidecars.get("imu", [])
+    vts_paths = clip.sidecars.get("vts", [])
+    avcc = read_avcc(clip.mp4s[0]) if clip.video.get("codec") == "h264" else None
+
+    with open(path, "wb") as fh:
+        w = McapWriter(fh)
+        w.header("trinet", "trinet-ingest")
+
+        # -- IMU messages -------------------------------------------------- #
+        imu_written = 0
+        if imu_paths:
+            sid = w.add_schema("trinet.Imu", "jsonschema", _IMU_SCHEMA)
+            cid = w.add_channel(sid, "/imu", "json",
+                                {"units": "accel m/s^2 (incl. gravity), "
+                                          "gyro rad/s; timestamps monotonic ns"})
+            seq = 0
+            for path_i in imu_paths:
+                for ts, acc, gyr, _mag in iter_imu_samples(path_i):
+                    msg = {
+                        "timestamp": _ns_time(ts),
+                        "linear_acceleration": {"x": acc[0], "y": acc[1],
+                                                "z": acc[2]},
+                        "angular_velocity": {"x": gyr[0], "y": gyr[1],
+                                             "z": gyr[2]},
+                    }
+                    w.message(cid, ts,
+                              json.dumps(msg, separators=(",", ":")).encode(),
+                              sequence=seq)
+                    seq += 1
+                    imu_written += 1
+
+        # -- Video messages (foxglove.CompressedVideo) --------------------- #
+        vid_written = 0
+        if avcc:
+            sof = [t for p in vts_paths for t in iter_vts_frames(p)]
+            sid = w.add_schema("foxglove.CompressedVideo", "jsonschema",
+                               _VIDEO_SCHEMA)
+            cid = w.add_channel(sid, "/camera", "json")
+            nominal = (clip.vts or {}).get("nominal_fps") or 30.0
+            period = int(1e9 / nominal) if nominal else 33_333_333
+            prev = sof[0] if sof and sof[0] else 0
+            for i, (au, _idr) in enumerate(iter_h264_access_units(clip.mp4s,
+                                                                  avcc)):
+                ts = sof[i] if i < len(sof) and sof[i] else prev + period
+                prev = ts
+                msg = {
+                    "timestamp": _ns_time(ts),
+                    "frame_id": "camera",
+                    "data": base64.b64encode(au).decode("ascii"),
+                    "format": "h264",
+                }
+                w.message(cid, ts,
+                          json.dumps(msg, separators=(",", ":")).encode(),
+                          sequence=i)
+                vid_written += 1
+
+        # -- Metadata record + attachments --------------------------------- #
+        flat = {}
+        _flatten_json(meta, "", flat)
+        w.metadata("trinet", flat)
+        w.attachment("metadata.json", "application/json",
+                     (json.dumps(meta, indent=2) + "\n").encode("utf-8"))
+        if calibration_path and os.path.isfile(calibration_path):
+            try:
+                with open(calibration_path, "rb") as cf:
+                    w.attachment(os.path.basename(calibration_path),
+                                 "application/json", cf.read())
+            except OSError:
+                pass
+
+        w.finish()
+
+    log.info("    mcap: %d imu + %d video messages" % (imu_written, vid_written))
+    if avcc and vid_written and clip.vts and \
+            clip.vts.get("frames") and vid_written != clip.vts["frames"]:
+        log.warn("%s: mcap video frames (%d) != .vts frames (%d)"
+                 % (clip.base, vid_written, clip.vts["frames"]))
+
+
+def _flatten_json(obj, prefix, out):
+    """Flatten nested metadata into dotted string key/values for the MCAP
+    Metadata record (which is a flat string->string map)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _flatten_json(v, "%s.%s" % (prefix, k) if prefix else k, out)
+    elif isinstance(obj, list):
+        out[prefix] = json.dumps(obj, separators=(",", ":"))
+    elif obj is None:
+        out[prefix] = ""
+    else:
+        out[prefix] = str(obj)
 
 
 # --------------------------------------------------------------------------- #
@@ -977,7 +1328,7 @@ def build_metadata(clip, args, calib, head):
 
     # Camera geometry, from --calibration / --head-transform.
     if calib:
-        _apply_calibration(meta["camera"], calib, head)
+        _apply_calibration(meta["camera"], calib, head, args)
     else:
         meta["camera"]["intrinsics"] = None
         meta["camera"]["extrinsics"] = None
@@ -985,6 +1336,20 @@ def build_metadata(clip, args, calib, head):
             "No calibration supplied at ingest, so camera intrinsics and "
             "extrinsics are absent. Provide the unit's calibration.json to "
             "populate them."
+        )
+
+    # Diagonal field of view (spec: Diagonal Field of View). An explicit
+    # --fov-deg wins; otherwise it comes from the calibration if present.
+    if args.fov_deg is not None:
+        meta["camera"]["diagonal_fov_deg"] = round(args.fov_deg, 1)
+        meta["camera"]["diagonal_fov_source"] = "stated (--fov-deg)"
+    elif meta["camera"].get("diagonal_fov_deg") is not None:
+        meta["camera"]["diagonal_fov_source"] = "computed from calibration"
+    else:
+        meta["camera"]["diagonal_fov_deg"] = None
+        meta["camera"]["diagonal_fov_note"] = (
+            "Not available: pass --fov-deg to state the lens field of view, "
+            "or --calibration to compute it from the intrinsics."
         )
 
     return meta
@@ -1070,7 +1435,7 @@ def _imu_metadata(clip):
     }
 
 
-def _apply_calibration(cam, calib, head):
+def _apply_calibration(cam, calib, head, args):
     """Fill camera.intrinsics and camera.extrinsics from a calibration."""
     intr = calib.get("intrinsics") or {}
     named = {
@@ -1088,6 +1453,21 @@ def _apply_calibration(cam, calib, head):
     cam["intrinsics"] = named
     cam["diagonal_fov_deg"] = calib["diagonal_fov_deg"]        # spec: FOV
     cam["calibration_source"] = calib["source_file"]
+
+    # Whether this calibration is for the exact unit or a batch representative.
+    scope = args.calibration_scope or "unspecified"
+    cam["calibration_scope"] = scope
+    if args.calibration_id:
+        cam["calibration_id"] = args.calibration_id
+    cam["calibration_scope_note"] = {
+        "device": ("Calibrated for this specific camera unit; the intrinsics "
+                   "and extrinsics apply directly to this recording."),
+        "batch": ("Batch calibration -- measured on a representative unit and "
+                  "applied to every camera in the production batch, NOT this "
+                  "exact unit. Per-unit optical variation is not captured."),
+        "unspecified": ("Calibration scope not stated at ingest; treat as "
+                        "approximate until confirmed as per-device or batch."),
+    }[scope]
 
     # Extrinsics: position + orientation relative to the head frame (spec R28/29).
     ext = {}
@@ -1149,6 +1529,7 @@ collected.
 | `{clip_id}.vts` | One capture timestamp per video frame. Binary. |
 | `{clip_id}.json` | The camera's own recording sidecar, when present. |
 | `metadata.json` | Collection metadata and camera calibration. |
+| `{clip_id}.mcap` | Present only if packaged with `--mcap`: video + IMU + metadata in one Foxglove-ready [MCAP](https://mcap.dev) container. |
 
 The recordings are {provenance}.
 
@@ -1299,6 +1680,7 @@ def package(clip, args, calib, head, log):
     # ZIP straight from the card, byte for byte. Staging happens only when
     # --repair asks for the MP4 indexes to be rebuilt.
     staging = tempfile.mkdtemp(prefix="trinet_ingest_") if args.repair else None
+    mcap_path = None
     try:
         rebuilt = 0
         if staging:
@@ -1307,6 +1689,19 @@ def package(clip, args, calib, head, log):
             sources = [(p, p) for p in clip.all_files()]
 
         meta = build_metadata(clip, args, calib, head)
+
+        # Optional MCAP: a single time-indexed container (IMU + video +
+        # metadata) that Foxglove and other robotics tools open directly.
+        mcap_path = None
+        if args.mcap:
+            mcap_path = os.path.join(staging or tempfile.mkdtemp(
+                prefix="trinet_mcap_"), clip.base + ".mcap")
+            try:
+                write_mcap(mcap_path, clip, meta, args.calibration, log)
+            except Exception as e:                    # never fail the ZIP
+                log.warn("%s: could not build MCAP (%s); skipping it"
+                         % (clip.base, e))
+                mcap_path = None
 
         tmp_zip = zip_path + ".part"
         with zipfile.ZipFile(tmp_zip, "w", allowZip64=True) as z:
@@ -1323,10 +1718,15 @@ def package(clip, args, calib, head, log):
                        README.format(clip_id=clip.base,
                                      provenance=_provenance(rebuilt)),
                        zipfile.ZIP_DEFLATED)
+            if mcap_path and os.path.isfile(mcap_path):
+                z.write(mcap_path, clip.base + ".mcap",
+                        compress_type=zipfile.ZIP_STORED)
         os.replace(tmp_zip, zip_path)
     finally:
         if staging:
             shutil.rmtree(staging, ignore_errors=True)
+        elif mcap_path:
+            shutil.rmtree(os.path.dirname(mcap_path), ignore_errors=True)
 
     log.info("    -> %s (%.1f MB)"
              % (zip_name, os.path.getsize(zip_path) / 1e6))
@@ -1397,9 +1797,25 @@ def build_parser():
 
     cal = p.add_argument_group("camera geometry")
     cal.add_argument("--calibration", metavar="FILE",
-                     help="calibration.json for this unit. Supplies the "
-                          "intrinsics and extrinsics the delivery spec "
-                          "requires.")
+                     help="calibration.json for this unit or batch. Supplies "
+                          "the intrinsics, distortion, field of view and "
+                          "extrinsics.")
+    cal.add_argument("--calibration-scope", choices=("device", "batch"),
+                     metavar="{device,batch}",
+                     help="Whether the calibration is for this exact unit "
+                          "('device') or a representative one for the "
+                          "production batch ('batch'). Recorded in "
+                          "metadata.json. If omitted with --calibration, the "
+                          "scope is marked 'unspecified' and a warning is "
+                          "printed.")
+    cal.add_argument("--calibration-id", metavar="ID",
+                     help="Optional identifier for the calibration / batch, "
+                          "recorded alongside the scope.")
+    cal.add_argument("--fov-deg", type=float, metavar="DEG",
+                     help="Diagonal field of view in degrees, stated "
+                          "explicitly. Overrides the value computed from the "
+                          "calibration; use it to record the nominal lens FOV "
+                          "when no calibration is supplied.")
     cal.add_argument("--camera-index", type=int, default=0, metavar="N",
                      help="Which camera in the calibration file (default 0).")
     cal.add_argument("--head-transform", metavar="FILE",
@@ -1411,6 +1827,13 @@ def build_parser():
                      help="Where to write the ZIPs (default: ./deliveries).")
     out.add_argument("--overwrite", action="store_true",
                      help="Replace ZIPs that already exist.")
+    out.add_argument("--mcap", action="store_true",
+                     help="Also write a <clip>.mcap into each ZIP: one "
+                          "time-indexed container with the IMU on an /imu "
+                          "topic, the video as foxglove.CompressedVideo on a "
+                          "/camera topic, and the metadata + calibration "
+                          "embedded. Opens directly in Foxglove. Adds the "
+                          "video a second time, so the ZIP roughly doubles.")
     out.add_argument("--repair", action="store_true",
                      help="Rebuild each MP4's index on a staged copy before "
                           "zipping, for uploaders that mis-read the recorded "
@@ -1479,15 +1902,23 @@ def main(argv=None):
     if args.calibration:
         try:
             calib = load_calibration(args.calibration, args.camera_index, log)
-            log.info("Calibration: %s (diagonal FOV %s deg)"
+            log.info("Calibration: %s (%s scope, diagonal FOV %s deg)"
                      % (os.path.basename(args.calibration),
+                        args.calibration_scope or "unspecified",
                         calib["diagonal_fov_deg"]))
         except (OSError, ValueError, KeyError) as e:
             print("error: could not read calibration: %s" % e)
             return 2
+        if not args.calibration_scope:
+            log.warn("no --calibration-scope given; metadata will mark the "
+                     "calibration 'unspecified'. Pass --calibration-scope "
+                     "device or batch to say which it is.")
     else:
         log.warn("no --calibration supplied: the intrinsics and extrinsics "
                  "keys will be absent from every metadata.json.")
+        if args.calibration_scope or args.calibration_id:
+            log.warn("--calibration-scope/--calibration-id ignored without "
+                     "--calibration.")
 
     head = None
     if args.head_transform:

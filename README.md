@@ -256,12 +256,16 @@ bitrate, GOP, B-frames and colour depth — the last three read straight from th
 H.264 bitstream), and the IMU metadata; `--calibration` folds in the intrinsics
 and extrinsics, with a properly computed fisheye field of view.
 
+Add `--mcap` to also emit a Foxglove-ready [MCAP](https://mcap.dev) per clip —
+IMU on an `/imu` topic and video as `foxglove.CompressedVideo` on a `/camera`
+topic, on one shared timeline, with the metadata and calibration embedded.
+
 **The recordings themselves are never altered** — they are copied into the ZIP
 byte for byte. **Standard-library Python 3 only**, no `pip install` and no
-`ffmpeg`.
+`ffmpeg`, MCAP included.
 
-Full guide, including the metadata field mapping, head-frame extrinsics and how
-the card is found and mounted:
+Full guide, including the metadata field mapping, batch-vs-device calibration,
+MCAP output and how the card is found and mounted:
 [`docs/data_collection_packaging.md`](docs/data_collection_packaging.md).
 
 ## Stereo recordings: depth, motion HUD, and SLAM

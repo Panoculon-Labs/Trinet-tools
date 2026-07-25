@@ -185,6 +185,37 @@ absent, which for most programs means the submission is incomplete.
 For stereo units, `--camera-index` selects which camera in the file (0 = the
 scene-left eye).
 
+### Batch vs per-device calibration
+
+A calibration may be for the **exact unit** that made the recording, or a
+**batch** calibration measured on one representative unit and applied to the
+whole production batch. Say which with `--calibration-scope`:
+
+```bash
+--calibration cal/batch-2026Q3.json --calibration-scope batch \
+    --calibration-id trinet-mono-batch-2026Q3
+```
+
+It is recorded in `metadata.json → camera.calibration_scope` (`device`,
+`batch`, or `unspecified`) with a note spelling out the implication — a batch
+calibration does not capture per-unit optical variation. If you pass
+`--calibration` without a scope, the field is marked `unspecified` and the
+script warns. `--calibration-id` optionally names the batch.
+
+### Field of view
+
+`camera.diagonal_fov_deg` is normally computed from the calibration. To state
+it explicitly — the nominal lens FOV, or when no calibration is on hand — pass
+`--fov-deg`:
+
+```bash
+--fov-deg 150
+```
+
+An explicit `--fov-deg` overrides the computed value, and
+`camera.diagonal_fov_source` records which was used (`stated (--fov-deg)` or
+`computed from calibration`).
+
 ### Head-frame extrinsics
 
 `calibration.json` gives the camera-to-inertial transform, not the camera's
@@ -234,6 +265,39 @@ it is unavailable, mount the card yourself and pass `--drive`.
 
 If several cards are attached at once the script stops and asks you to pick one
 with `--drive`, rather than guessing.
+
+## MCAP output
+
+Programs that prefer a single time-indexed container over separate files can
+get an [MCAP](https://mcap.dev) with `--mcap`. Each clip's ZIP then also holds
+a `<clip>.mcap` carrying:
+
+- **`/imu`** — one message per inertial sample (`trinet.Imu`: linear
+  acceleration in m/s², angular velocity in rad/s), timestamped on the
+  recording's monotonic clock.
+- **`/camera`** — one `foxglove.CompressedVideo` message per frame (H.264,
+  Annex-B, SPS/PPS prepended to each keyframe), timestamped from the `.vts` so
+  it lines up with the IMU on a shared clock. Written only for H.264
+  recordings.
+- the **metadata** as an MCAP metadata record plus the full `metadata.json` as
+  an attachment, and the **`calibration.json`** as an attachment when supplied.
+
+It opens directly in [Foxglove](https://foxglove.dev) — video and IMU scrub on
+one timeline — and is written with no external tools or libraries (the same
+zero-dependency, stdlib-only Python as the rest of the script).
+
+```bash
+python3 scripts/ingest_sd_card.py --drive E: --collector alice01 \
+    --country US --calibration cal/unit.json --calibration-scope batch \
+    --mcap --out ./deliveries
+```
+
+Because the video is stored again inside the MCAP, `--mcap` roughly doubles the
+size of each ZIP. The standalone `.mp4` remains in the ZIP either way, so the
+MCAP is an addition, not a replacement. Timestamps in the MCAP are monotonic
+nanoseconds from power-on (the camera has no real-time clock); both topics
+share that clock, so they are mutually synchronised even though they are not
+wall-clock.
 
 ## Capture dates
 
