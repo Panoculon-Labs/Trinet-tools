@@ -245,19 +245,21 @@ python scripts\ingest_sd_card.py --drive E: --collector alice01 ^
 ```
 alice01_20260720_aa3d26ba_recording3_1.zip
     recording3_1.{mp4,imu,vts,json}
-    metadata.json     what you supplied, plus device id and duration
+    metadata.json     collection details + camera calibration + video/IMU specs
     README.md         how to read the files
 ```
 
 It finds the card by itself (mounting it read-only if the system has not), and
 handles solo recordings and synced multi-camera takes alike. `metadata.json`
-carries what you passed on the command line plus the recording's device id and
-duration; `--calibration` folds in the intrinsics and extrinsics, with a
-properly computed fisheye field of view.
+covers the full collection spec: the details you pass on the command line, the
+device id, the video's technical properties (codec, resolution, frame rate,
+bitrate, GOP, B-frames and colour depth — the last three read straight from the
+H.264 bitstream), and the IMU metadata; `--calibration` folds in the intrinsics
+and extrinsics, with a properly computed fisheye field of view.
 
 **The recordings themselves are never altered** — they are copied into the ZIP
-byte for byte, and nothing is inspected, graded or filtered. **Standard-library
-Python 3 only**, no `pip install` and no `ffmpeg`.
+byte for byte. **Standard-library Python 3 only**, no `pip install` and no
+`ffmpeg`.
 
 Full guide, including the environment taxonomy, head-frame extrinsics and how
 the card is found and mounted:

@@ -70,7 +70,7 @@ ENVIRONMENTS = {
     ],
 }
 
-METADATA_SCHEMA = "trinet-delivery-metadata/1"
+METADATA_SCHEMA = "trinet-delivery-metadata/2"
 
 # Sidecar extensions that travel with a clip, in ZIP order.
 SIDECARS = ("imu", "vts", "json", "tel")
@@ -129,13 +129,15 @@ class Log:
 # --------------------------------------------------------------------------- #
 # Reading the recording
 #
-# Only two things are read out of a recording: which unit made it, and how long
-# it runs. Everything else the files contain is passed through untouched -- see
-# docs/data_formats.md for the full byte-level specification.
+# What the recording contains is measured so it can be described in the
+# metadata; the files themselves are always passed through untouched. The full
+# byte-level specification of every format is in docs/data_formats.md.
 # --------------------------------------------------------------------------- #
 IMU_MAGIC = b"TRIMU001"
 IMU_HEADER = 64
 IMU_SAMPLE_SIZE = {1: 44, 2: 76, 3: 80, 4: 80, 5: 80, 6: 80}
+ACCEL_FS_G = {0: 2, 1: 4, 2: 8, 3: 16}
+GYRO_FS_DPS = {0: 250, 1: 500, 2: 1000, 3: 2000}
 
 VTS_MAGIC = b"TRIVTS01"
 VTS_HEADER = 32
@@ -143,7 +145,7 @@ VTS_ENTRY_SIZE = {1: 12, 2: 24, 3: 24, 4: 36}
 
 
 def read_imu(path):
-    """Device id and sample span from a .imu sidecar, or None if unreadable."""
+    """Device id, sensors, ranges, sample rate and span from a .imu sidecar."""
     size = os.path.getsize(path)
     if size < IMU_HEADER:
         return None
@@ -156,6 +158,7 @@ def read_imu(path):
         if not ssize:
             return {"version": version, "unsupported": True}
         n = (size - IMU_HEADER) // ssize
+        flags = _u32(h, 36) if version >= 3 else 0
 
         # The device id occupies bytes that were reserved (zero) before v3, so
         # an older recording reads as "unknown" rather than as garbage.
@@ -164,18 +167,27 @@ def read_imu(path):
             "version": version,
             "samples": n,
             "device_id": "" if devid == "0" * 32 else devid,
+            "nominal_rate_hz": _u32(h, 12),
+            "accel_range_g": ACCEL_FS_G.get(_u16(h, 16)),
+            "gyro_range_dps": GYRO_FS_DPS.get(_u16(h, 18)),
+            "frame_sync": bool(flags & 0x1),
+            "magnetometer": bool(flags & 0x2),
             "duration_s": 0.0,
+            "actual_rate_hz": None,
         }
         if n >= 2:
             first = _u64(f.read(8), 0)
             f.seek(IMU_HEADER + (n - 1) * ssize)
             last = _u64(f.read(8), 0)
-            info["duration_s"] = (last - first) / 1e9
+            span = (last - first) / 1e9
+            info["duration_s"] = span
+            if span > 0:
+                info["actual_rate_hz"] = (n - 1) / span
     return info
 
 
 def read_vts(path):
-    """Recording length from the per-frame timestamps, the most accurate source."""
+    """Frame count, measured fps and length from the per-frame timestamps."""
     size = os.path.getsize(path)
     if size < VTS_HEADER:
         return None
@@ -188,21 +200,209 @@ def read_vts(path):
         if not esize:
             return {"version": version, "unsupported": True}
         n = (size - VTS_HEADER) // esize
-        info = {"version": version, "frames": n, "duration_s": 0.0}
+        info = {
+            "version": version,
+            "frames": n,
+            "nominal_fps": _u32(h, 12) / 1000.0,
+            "duration_s": 0.0,
+            "avg_fps": None,
+        }
         if n < 2:
             return info
         body = f.read(n * esize)
 
     # A zero timestamp means "unavailable" for that frame; skip those.
     stamps = [t for t in (_u64(body, i * esize + 4) for i in range(n)) if t]
+    info["timestamped_frames"] = len(stamps)
     if len(stamps) >= 2:
-        info["duration_s"] = (stamps[-1] - stamps[0]) / 1e9
+        span = (stamps[-1] - stamps[0]) / 1e9
+        info["duration_s"] = span
+        if span > 0:
+            info["avg_fps"] = (len(stamps) - 1) / span
     return info
+
+
+# -- MP4 container + H.264 bitstream -------------------------------------------
+# The video specs the delivery program cares about -- codec, resolution, GOP,
+# whether B-frames are present, colour depth -- are read straight from the MP4
+# and the H.264 bitstream, with no external tools. GOP and B-frame presence are
+# properties of the encoder, so a bounded scan of the first frames settles them.
+CODEC_FOURCC = {b"avc1": "h264", b"avc3": "h264",
+                b"hvc1": "h265", b"hev1": "h265"}
+_H264_SLICE_NALS = (1, 5)          # coded slice (non-IDR / IDR)
+_H264_PROFILE_HAS_BITDEPTH = {100, 110, 122, 244, 44, 83, 86, 118, 128,
+                              138, 139, 134, 135}
+_SLICE_SCAN_CAP = 4000             # frames; enough to fix GOP/B-frames
+
+
+def _rbsp(nal):
+    """Strip H.264 emulation-prevention 0x03 bytes."""
+    out = bytearray()
+    i, n = 0, len(nal)
+    while i < n:
+        if i + 2 < n and nal[i] == 0 and nal[i + 1] == 0 and nal[i + 2] == 3:
+            out += nal[i:i + 2]
+            i += 3
+        else:
+            out.append(nal[i])
+            i += 1
+    return bytes(out)
+
+
+class _BitReader:
+    def __init__(self, data):
+        self.d = data
+        self.pos = 0
+
+    def bit(self):
+        b = (self.d[self.pos >> 3] >> (7 - (self.pos & 7))) & 1
+        self.pos += 1
+        return b
+
+    def bits(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.bit()
+        return v
+
+    def ue(self):
+        z = 0
+        while self.bit() == 0:
+            z += 1
+        return (1 << z) - 1 + (self.bits(z) if z else 0)
+
+    def se(self):
+        k = self.ue()
+        return (k + 1) // 2 if k & 1 else -(k // 2)
+
+
+def _parse_sps(sps):
+    """Colour bit depth and profile from an H.264 SPS NAL."""
+    r = _BitReader(_rbsp(sps[1:]))             # skip the NAL header byte
+    profile = r.bits(8)
+    r.bits(8)                                  # constraint flags + reserved
+    r.bits(8)                                  # level
+    r.ue()                                     # seq_parameter_set_id
+    bit_depth = 8
+    if profile in _H264_PROFILE_HAS_BITDEPTH:
+        chroma = r.ue()
+        if chroma == 3:
+            r.bit()
+        bit_depth = r.ue() + 8                 # bit_depth_luma_minus8
+    return {"profile": profile, "color_depth_bits": bit_depth}
+
+
+def probe_video(paths):
+    """Codec, resolution, GOP, B-frame presence and colour depth for a clip.
+
+    `paths` is the clip's MP4 file(s) (more than one only for chunked takes).
+    Returns a dict; keys that need the H.264 bitstream are absent for other
+    codecs. Never raises -- unreadable files yield an empty-ish result.
+    """
+    out = {"file_bytes": sum(_safe_size(p) for p in paths)}
+    if len(paths) > 1:
+        out["parts"] = len(paths)
+
+    nal_len, sps, codec = 4, None, None
+    first = paths[0]
+    try:
+        size = _safe_size(first)
+        with open(first, "rb") as f:
+            moov = next((r for t, *r in
+                         ((t, s, e) for t, s, e in _boxes(f, 0, size))
+                         if t == b"moov"), None)
+            if moov:
+                for st, en in _descend(f, moov[0], moov[1],
+                                       (b"trak", b"mdia", b"minf",
+                                        b"stbl", b"stsd")):
+                    f.seek(st + 8)
+                    entry = f.read(min(320, en - st - 8))
+                    if len(entry) < 36:
+                        continue
+                    codec = CODEC_FOURCC.get(entry[4:8])
+                    if not codec:
+                        continue
+                    out["codec"] = codec
+                    out["width"] = _u16be(entry, 32)
+                    out["height"] = _u16be(entry, 34)
+                    idx = entry.find(b"avcC")
+                    if idx >= 0:
+                        av = entry[idx + 4:]
+                        nal_len = (av[4] & 3) + 1
+                        if av[5] & 0x1f:
+                            L = _u16be(av, 6)
+                            sps = av[8:8 + L]
+                    break
+    except OSError:
+        return out
+
+    if sps:
+        try:
+            out.update(_parse_sps(sps))
+        except (IndexError, ValueError):
+            pass
+
+    # GOP + B-frames need slice types, so walk the coded-slice NALs. Every mdat
+    # (one per fragment in a fragmented file) is a run of length-prefixed NALs.
+    if codec == "h264":
+        idr, frames, has_b, capped = [], 0, False, False
+        try:
+            for p in paths:
+                if capped:
+                    break
+                psize = _safe_size(p)
+                with open(p, "rb") as f:
+                    for t, st, en in _boxes(f, 0, psize):
+                        if t != b"mdat":
+                            continue
+                        o = st
+                        while o + nal_len <= en:
+                            f.seek(o)
+                            lb = f.read(nal_len)
+                            if len(lb) < nal_len:
+                                break
+                            L = int.from_bytes(lb, "big")
+                            if L == 0 or o + nal_len + L > en:
+                                break
+                            f.seek(o + nal_len)
+                            sl = f.read(min(16, L))
+                            if sl and (sl[0] & 0x1f) in _H264_SLICE_NALS:
+                                ntype = sl[0] & 0x1f
+                                br = _BitReader(_rbsp(sl[1:]))
+                                br.ue()                 # first_mb_in_slice
+                                if br.ue() % 5 == 1:    # slice_type B
+                                    has_b = True
+                                if ntype == 5:
+                                    idr.append(frames)
+                                frames += 1
+                                if frames >= _SLICE_SCAN_CAP:
+                                    capped = True
+                                    break
+                            o += nal_len + L
+                        if capped:
+                            break
+        except OSError:
+            pass
+        out["b_frames"] = has_b
+        out["frames_scanned"] = frames
+        if capped:
+            out["scan_capped"] = True
+        if len(idr) >= 2:
+            gaps = [idr[i + 1] - idr[i] for i in range(len(idr) - 1)]
+            out["gop_length"] = max(set(gaps), key=gaps.count)
+    return out
+
+
+def _safe_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def mp4_duration(path):
     """Container duration, used only when no .vts or .imu is present."""
-    size = os.path.getsize(path)
+    size = _safe_size(path)
     try:
         with open(path, "rb") as f:
             moov = None
@@ -225,6 +425,10 @@ def mp4_duration(path):
     except OSError:
         return None
     return None
+
+
+def _u16be(b, o):
+    return struct.unpack_from(">H", b, o)[0]
 
 
 def _boxes(f, start, end):
@@ -379,11 +583,14 @@ class Clip:
         self.chunked = chunked
         self.imu = None
         self.vts = None
+        self.video = {}
         self.meta_sidecar = {}
         self.device_id_conflict = None
 
     # -- parsing ----------------------------------------------------------- #
     def parse(self, log):
+        self.video = probe_video(self.mp4s)
+
         for path in self.sidecars.get("imu", []):
             got = read_imu(path)
             if got and not got.get("unsupported"):
@@ -408,6 +615,17 @@ class Clip:
             except (OSError, ValueError):
                 log.warn("%s: recording sidecar is unreadable" % self.base)
 
+        # Rates are recomputed from the merged totals, not taken from whichever
+        # chunk happened to be read first.
+        if self.vts and self.vts.get("duration_s"):
+            n = self.vts.get("timestamped_frames") or self.vts.get("frames", 0)
+            if n >= 2:
+                self.vts["avg_fps"] = (n - 1) / self.vts["duration_s"]
+        if self.imu and self.imu.get("duration_s"):
+            n = self.imu.get("samples", 0)
+            if n >= 2:
+                self.imu["actual_rate_hz"] = (n - 1) / self.imu["duration_s"]
+
         # The camera writes its id into both the .imu header and the sidecar.
         # If they disagree, the card holds files from more than one unit.
         sidecar_id = self.meta_sidecar.get("device_id") or ""
@@ -423,7 +641,7 @@ class Clip:
         """Add a chunked part's sidecar onto the running clip total."""
         if acc is None:
             return got
-        for k in ("samples", "frames"):
+        for k in ("samples", "frames", "timestamped_frames"):
             if k in acc or k in got:
                 acc[k] = (acc.get(k) or 0) + (got.get(k) or 0)
         acc["duration_s"] = (acc.get("duration_s") or 0.0) + \
@@ -441,6 +659,14 @@ class Clip:
         for p in self.mp4s:
             total += mp4_duration(p) or 0.0
         return total or None
+
+    @property
+    def bitrate_mbps(self):
+        d = self.duration_s
+        b = self.video.get("file_bytes")
+        if not d or not b:
+            return None
+        return b * 8 / d / 1e6
 
     @property
     def device_id(self):
@@ -726,12 +952,16 @@ def autodetect_cards():
 # Metadata assembly
 # --------------------------------------------------------------------------- #
 def build_metadata(clip, args, calib, head):
-    """Collection metadata for one clip.
+    """Per-clip delivery metadata, mapping the collection specification.
 
-    Deliberately minimal: what the operator supplied on the command line, plus
-    which unit recorded the clip and how long it runs. Everything else stays in
-    the recording itself -- see the format reference in the Trinet-Tools
-    repository for how to read it.
+    Covers, per the customer's specification sheet: environment type and
+    sub-category, geographic location, collector and session ids, camera
+    intrinsics (focal length, distortion) and extrinsics (position and
+    orientation relative to the head frame), the video technical properties
+    (codec, resolution, aspect, frame rate, bitrate, GOP, B-frames, colour
+    depth, clip length) and the IMU metadata (accelerometer/gyroscope, sample
+    rate and video synchronisation). Fields that need a calibration file are
+    present only when one is supplied.
     """
     ms = clip.meta_sidecar
     session_no = ms.get("session") or 0
@@ -743,19 +973,26 @@ def build_metadata(clip, args, calib, head):
     meta = {
         "schema": METADATA_SCHEMA,
         "clip_id": clip.base,
-        "collector_id": args.collector,
-        "session_id": session_id,
-        "environment": {
+        "collector_id": args.collector,          # spec: User ID
+        "session_id": session_id,                # spec: Session ID
+        "environment": {                         # spec: Environment Type
             "type": args.env_type,
             "subcategory": args.env_subcategory,
         },
-        "location": {"country": args.country},
+        "location": {"country": args.country},   # spec: Geographic Location
         "capture": {"date": args.capture_date},
         "camera": {
+            "make": "Panoculon Labs",
+            "model": "Trinet",
             "device_id": clip.device_id or None,
-            "placement": {"mount": args.mount},
+            "placement": {                       # spec: Camera Placement
+                "mount": args.mount,
+                "orientation": args.orientation,
+            },
         },
-        "duration_s": _round(clip.duration_s, 3),
+        "video": _video_metadata(clip),          # spec: Camera Specifications
+        "imu": _imu_metadata(clip),              # spec: IMU / IMU Metadata
+        "duration_s": _round(clip.duration_s, 3),  # spec: Clip Length
     }
 
     if args.env_note:
@@ -773,22 +1010,150 @@ def build_metadata(clip, args, calib, head):
 
     # Camera geometry, from --calibration / --head-transform.
     if calib:
-        cam = meta["camera"]
-        cam["intrinsics"] = calib["intrinsics"]
-        cam["diagonal_fov_deg"] = calib["diagonal_fov_deg"]
-        cam["calibration_source"] = calib["source_file"]
-        ext = {}
-        if calib.get("T_cam_imu"):
-            ext["T_cam_imu"] = calib["T_cam_imu"]
-            ext["T_cam_imu_note"] = calib["T_cam_imu_note"]
-        if calib.get("timeshift_cam_imu_s") is not None:
-            ext["timeshift_cam_imu_s"] = calib["timeshift_cam_imu_s"]
-        if head:
-            ext["head_frame"] = head
-        if ext:
-            cam["extrinsics"] = ext
+        _apply_calibration(meta["camera"], calib, head)
+    else:
+        meta["camera"]["intrinsics"] = None
+        meta["camera"]["extrinsics"] = None
+        meta["camera"]["calibration_note"] = (
+            "No calibration supplied at ingest, so camera intrinsics and "
+            "extrinsics are absent. Provide the unit's calibration.json to "
+            "populate them."
+        )
 
     return meta
+
+
+def _video_metadata(clip):
+    """Video technical block: codec, resolution, aspect, fps, bitrate, GOP,
+    B-frames, colour depth. Maps the Camera Specifications rows of the spec."""
+    v = clip.video or {}
+    vts = clip.vts or {}
+    w, h = v.get("width"), v.get("height")
+    out = {
+        "container": "mp4",
+        "codec": v.get("codec"),                     # Video Format
+        "width": w,
+        "height": h,
+        "duration_s": _round(clip.duration_s, 3),    # Clip Length
+        "bitrate_mbps": _round(clip.bitrate_mbps, 2),  # Bitrate
+        "file_bytes": v.get("file_bytes"),
+    }
+    if w and h:
+        out["resolution_mp"] = round(w * h / 1e6, 2)  # Resolution
+        out["aspect_ratio"] = "landscape" if w > h else "portrait"  # Aspect
+    if vts.get("frames"):
+        out["frame_count"] = vts["frames"]
+    if vts.get("nominal_fps"):
+        out["nominal_fps"] = vts["nominal_fps"]      # Frame Rate
+    if vts.get("avg_fps") is not None:
+        out["average_fps"] = _round(vts["avg_fps"], 2)  # Avg FPS after drops
+    # These come from the H.264 bitstream, so they exist only for H.264.
+    for key in ("gop_length", "color_depth_bits"):   # GOP, Colour Depth
+        if key in v:
+            out[key] = v[key]
+    if "b_frames" in v:                              # B-Frames
+        out["b_frames"] = v["b_frames"]
+    if v.get("chunked") or clip.chunked:
+        out["chunked"] = True
+        out["parts"] = v.get("parts")
+    return out
+
+
+def _imu_metadata(clip):
+    """IMU metadata block: sensors, sample rate, ranges, video sync. Maps the
+    IMU Data and IMU Metadata rows of the spec."""
+    imu = clip.imu
+    if not imu:
+        return {
+            "present": False,
+            "note": "No inertial sidecar found for this clip.",
+        }
+    sensors = ["accelerometer", "gyroscope"]         # spec: sensors required
+    if imu.get("magnetometer"):
+        sensors.append("magnetometer")
+    imu_files = [os.path.basename(p) for p in clip.sidecars.get("imu", [])]
+    sync_method = ("hardware frame-sync pulse" if imu.get("frame_sync")
+                   else "shared monotonic clock")
+    return {
+        "present": True,
+        "data_files": imu_files,
+        "sensors": sensors,                          # Accelerometer + Gyroscope
+        "sample_rate_hz": _round(imu.get("actual_rate_hz"), 2),  # Sample Rate
+        "nominal_rate_hz": imu.get("nominal_rate_hz"),
+        "sample_count": imu.get("samples"),
+        "duration_s": _round(imu.get("duration_s"), 3),
+        "accelerometer": {                           # Accelerometer Data
+            "range_g": imu.get("accel_range_g"),
+            "units": "m/s^2 (gravity included)",
+        },
+        "gyroscope": {                               # Gyroscope Data
+            "range_dps": imu.get("gyro_range_dps"),
+            "units": "rad/s",
+        },
+        "video_sync": {                              # Synchronization Info
+            "tolerance_ms": 1,
+            "method": sync_method,
+            "align_using": "sof_timestamp_ns in the .vts sidecar",
+            "note": (
+                "Inertial samples and per-frame video timestamps share one "
+                "monotonic clock, so they need no cross-correlation; alignment "
+                "error is bounded by the IMU sample period (well under 1 ms)."
+            ),
+        },
+    }
+
+
+def _apply_calibration(cam, calib, head):
+    """Fill camera.intrinsics and camera.extrinsics from a calibration."""
+    intr = calib.get("intrinsics") or {}
+    named = {
+        "image_size": intr.get("image_size"),
+        "projection_model": intr.get("model"),
+    }
+    if intr.get("fx") is not None:
+        named["focal_length_px"] = {"fx": intr.get("fx"),  # spec: Focal Length
+                                    "fy": intr.get("fy")}
+    if intr.get("cx") is not None:
+        named["principal_point_px"] = {"cx": intr.get("cx"),
+                                       "cy": intr.get("cy")}
+    named["distortion_model"] = intr.get("model")
+    named["distortion_coefficients"] = intr.get("distortion")  # spec: Distortion
+    cam["intrinsics"] = named
+    cam["diagonal_fov_deg"] = calib["diagonal_fov_deg"]        # spec: FOV
+    cam["calibration_source"] = calib["source_file"]
+
+    # Extrinsics: position + orientation relative to the head frame (spec R28/29).
+    ext = {}
+    if head:
+        hf = {"source": head.get("source")}
+        if head.get("T_head_cam") is not None:
+            hf["T_head_cam"] = head["T_head_cam"]
+            hf["note"] = ("4x4 head-from-camera transform; the translation is "
+                          "the camera position in the head frame, the rotation "
+                          "its orientation.")
+        else:
+            hf["position_m"] = head.get("translation_m")        # R28
+            hf["orientation_deg"] = head.get("rotation_deg")    # R29
+            hf["orientation_convention"] = head.get("rotation_order")
+        ext["head_frame"] = hf
+    else:
+        ext["head_frame"] = {
+            "measured": False,
+            "note": (
+                "No mount pose supplied (--head-transform), so the camera's "
+                "position and orientation relative to the head frame are not "
+                "given. The camera<-IMU extrinsic below is still provided."
+            ),
+        }
+    if calib.get("T_cam_imu"):
+        ext["camera_to_imu"] = {
+            "T_cam_imu": calib["T_cam_imu"],
+            "note": calib["T_cam_imu_note"],
+        }
+        if calib.get("timeshift_cam_imu_s") is not None:
+            ext["camera_to_imu"]["timeshift_cam_imu_s"] = \
+                calib["timeshift_cam_imu_s"]
+    cam["extrinsics"] = ext
 
 
 # --------------------------------------------------------------------------- #
@@ -1095,7 +1460,12 @@ environment values:
                           "be read from the card.")
     opt.add_argument("--mount", default="head_forehead",
                      metavar="DESC",
-                     help="Mount position (default: head_forehead).")
+                     help="Mounting position on the body "
+                          "(default: head_forehead).")
+    opt.add_argument("--orientation", default="downward",
+                     metavar="DESC",
+                     help="Camera orientation (default: downward, for hand "
+                          "visibility).")
 
     cal = p.add_argument_group("camera geometry")
     cal.add_argument("--calibration", metavar="FILE",

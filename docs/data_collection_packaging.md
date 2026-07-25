@@ -71,34 +71,95 @@ by their `.mp4`, not by name, so neither naming scheme is special-cased.
 
 ## What goes in metadata.json
 
-Deliberately small: **what you supplied on the command line**, plus which unit
-recorded the clip and how long it runs. Nothing is inferred or editorialised.
+Each clip's `metadata.json` covers the full collection specification: the
+details you supplied on the command line, the camera geometry from the
+calibration, the video's technical properties (measured from the file), and the
+IMU metadata.
 
 ```json
 {
-  "schema": "trinet-delivery-metadata/1",
+  "schema": "trinet-delivery-metadata/2",
   "clip_id": "grp10580_329b911e_1",
   "collector_id": "alice01",
   "session_id": "alice01-20260722-329b911e-s10580",
   "environment": { "type": "residential", "subcategory": "laundry" },
-  "location": { "country": "US" },
+  "location": { "country": "IN", "region": "Bhopal" },
   "capture": { "date": "2026-07-22" },
   "camera": {
+    "make": "Panoculon Labs", "model": "Trinet",
     "device_id": "329b911ecd8c67e288d969f92ca8d4d1",
-    "placement": { "mount": "head_forehead" }
+    "placement": { "mount": "head_forehead", "orientation": "downward" },
+    "intrinsics": {
+      "image_size": [1920, 1080],
+      "projection_model": "equidistant",
+      "focal_length_px": { "fx": 587.8, "fy": 592.2 },
+      "principal_point_px": { "cx": 897.1, "cy": 603.5 },
+      "distortion_model": "equidistant",
+      "distortion_coefficients": [0.139, 0.063, -0.076, 0.016]
+    },
+    "diagonal_fov_deg": 182.7,
+    "extrinsics": {
+      "head_frame": { "position_m": [0.0, 0.02, 0.09],
+                      "orientation_deg": [-25.0, 0.0, 0.0] },
+      "camera_to_imu": { "T_cam_imu": [[...]], "timeshift_cam_imu_s": 0.0099 }
+    }
+  },
+  "video": {
+    "container": "mp4", "codec": "h264",
+    "width": 1920, "height": 1080, "resolution_mp": 2.07,
+    "aspect_ratio": "landscape",
+    "duration_s": 11.567, "frame_count": 344,
+    "nominal_fps": 30.0, "average_fps": 29.65,
+    "bitrate_mbps": 9.78,
+    "gop_length": 30, "b_frames": false, "color_depth_bits": 8
+  },
+  "imu": {
+    "present": true, "data_files": ["grp10580_329b911e_1.imu"],
+    "sensors": ["accelerometer", "gyroscope", "magnetometer"],
+    "sample_rate_hz": 399.9, "nominal_rate_hz": 400, "sample_count": 4622,
+    "accelerometer": { "range_g": 8, "units": "m/s^2 (gravity included)" },
+    "gyroscope": { "range_dps": 2000, "units": "rad/s" },
+    "video_sync": { "tolerance_ms": 1, "method": "shared monotonic clock",
+                    "align_using": "sof_timestamp_ns in the .vts sidecar" }
   },
   "duration_s": 11.567,
   "task": { "description": "fold and put away laundry" }
 }
 ```
 
-`--calibration` adds `camera.intrinsics`, `camera.diagonal_fov_deg` and
-`camera.extrinsics`; `--region`, `--task`, `--task-labels`, `--participant-id`
-and `--env-note` add their own keys. Keys you did not supply are simply absent.
+### How the fields map to the specification
 
-Everything else — frame rate, sample rate, resolution, codec, per-frame timing —
-already lives in the recording itself, so it is not duplicated here. See
-[`data_formats.md`](data_formats.md) for how to read it.
+| Spec row | metadata.json |
+|---|---|
+| Environment Type | `environment.type` + `environment.subcategory` |
+| Geographic Location | `location.country` (+ optional `region`) |
+| User ID / Session ID | `collector_id` / `session_id` |
+| Camera Resolution / Frame Rate | `video.resolution_mp` / `video.nominal_fps` |
+| Video Format | `video.codec` + `video.container` |
+| Diagonal Field of View | `camera.diagonal_fov_deg` |
+| Aspect Ratio | `video.aspect_ratio` |
+| Average FPS (after drops) | `video.average_fps` |
+| Bitrate | `video.bitrate_mbps` |
+| Color Depth | `video.color_depth_bits` |
+| GOP Length | `video.gop_length` |
+| B-Frames | `video.b_frames` |
+| Clip Length | `duration_s` / `video.duration_s` |
+| Mounting Position / Orientation | `camera.placement.mount` / `.orientation` |
+| Camera Intrinsics (focal length) | `camera.intrinsics.focal_length_px` |
+| Camera Intrinsics (distortion) | `camera.intrinsics.distortion_coefficients` |
+| Camera Extrinsics (position/orientation vs head) | `camera.extrinsics.head_frame` |
+| IMU sensors / accel / gyro | `imu.sensors`, `imu.accelerometer`, `imu.gyroscope` |
+| IMU Sample Rate | `imu.sample_rate_hz` |
+| IMU-to-Video Sync | `imu.video_sync` |
+
+`video.gop_length`, `video.b_frames` and `video.color_depth_bits` are read
+directly from the H.264 bitstream (no external tools), so they are present only
+for H.264 recordings. `camera.intrinsics`, `camera.diagonal_fov_deg` and
+`camera.extrinsics` need `--calibration`; without it they are `null` with a
+note. `camera.extrinsics.head_frame` carries the camera's position and
+orientation relative to the head frame when `--head-transform` is supplied.
+Optional flags (`--region`, `--task`, `--task-labels`, `--participant-id`,
+`--env-note`) add their own keys; keys you did not supply are simply absent.
 
 ## Required flags
 
