@@ -19,7 +19,6 @@ Typical use on Windows:
 
     python scripts\\ingest_sd_card.py --drive E: ^
         --collector alice01 --country US ^
-        --environment residential/laundry ^
         --calibration cal\\unit-aa3d26ba.json ^
         --out D:\\deliveries
 
@@ -48,27 +47,6 @@ try:
 except Exception:                                    # pragma: no cover
     _flatten_file = None
 
-
-# Environment taxonomy. type -> allowed sub-categories.
-ENVIRONMENTS = {
-    "residential": [
-        "laundry",
-        "kitchen_tidy",
-        "organize_room",
-        "other_household",
-    ],
-    "commercial": [
-        "agriculture_landscaping_grounds",
-        "hospitality_housekeeping",
-        "automotive_service_maintenance",
-        "food_service_back_of_house",
-        "field_services_light_installation",
-        "commercial_cleaning_janitorial",
-        "retail_stocking_back_of_house",
-        "construction_skilled_trades",
-        "other",
-    ],
-}
 
 METADATA_SCHEMA = "trinet-delivery-metadata/2"
 
@@ -954,14 +932,13 @@ def autodetect_cards():
 def build_metadata(clip, args, calib, head):
     """Per-clip delivery metadata, mapping the collection specification.
 
-    Covers, per the customer's specification sheet: environment type and
-    sub-category, geographic location, collector and session ids, camera
-    intrinsics (focal length, distortion) and extrinsics (position and
-    orientation relative to the head frame), the video technical properties
-    (codec, resolution, aspect, frame rate, bitrate, GOP, B-frames, colour
-    depth, clip length) and the IMU metadata (accelerometer/gyroscope, sample
-    rate and video synchronisation). Fields that need a calibration file are
-    present only when one is supplied.
+    Covers, per the customer's specification sheet: geographic location,
+    collector and session ids, camera intrinsics (focal length, distortion)
+    and extrinsics (position and orientation relative to the head frame), the
+    video technical properties (codec, resolution, aspect, frame rate, bitrate,
+    GOP, B-frames, colour depth, clip length) and the IMU metadata
+    (accelerometer/gyroscope, sample rate and video synchronisation). Fields
+    that need a calibration file are present only when one is supplied.
     """
     ms = clip.meta_sidecar
     session_no = ms.get("session") or 0
@@ -975,28 +952,18 @@ def build_metadata(clip, args, calib, head):
         "clip_id": clip.base,
         "collector_id": args.collector,          # spec: User ID
         "session_id": session_id,                # spec: Session ID
-        "environment": {                         # spec: Environment Type
-            "type": args.env_type,
-            "subcategory": args.env_subcategory,
-        },
         "location": {"country": args.country},   # spec: Geographic Location
         "capture": {"date": args.capture_date},
         "camera": {
             "make": "Panoculon Labs",
             "model": "Trinet",
             "device_id": clip.device_id or None,
-            "placement": {                       # spec: Camera Placement
-                "mount": args.mount,
-                "orientation": args.orientation,
-            },
         },
         "video": _video_metadata(clip),          # spec: Camera Specifications
         "imu": _imu_metadata(clip),              # spec: IMU / IMU Metadata
         "duration_s": _round(clip.duration_s, 3),  # spec: Clip Length
     }
 
-    if args.env_note:
-        meta["environment"]["note"] = args.env_note
     if args.region:
         meta["location"]["region"] = args.region
     if args.participant_id:
@@ -1369,22 +1336,6 @@ def package(clip, args, calib, head, log):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def parse_environment(value):
-    """Split TYPE/SUBCATEGORY. Any values are accepted; the known collection
-    taxonomy is only used to warn (in main), never to reject -- custom
-    environments are a legitimate case the spec allows via "other"."""
-    if "/" not in value:
-        raise argparse.ArgumentTypeError(
-            "use TYPE/SUBCATEGORY, e.g. residential/laundry")
-    etype, sub = value.split("/", 1)
-    etype = etype.strip().lower()
-    sub = sub.strip().lower().replace(" ", "_").replace("-", "_")
-    if not etype or not sub:
-        raise argparse.ArgumentTypeError(
-            "both TYPE and SUBCATEGORY are required, e.g. residential/laundry")
-    return etype, sub
-
-
 def parse_date(value):
     try:
         return _dt.date.fromisoformat(value).isoformat()
@@ -1401,24 +1352,16 @@ def build_parser():
         epilog="""examples:
   # Windows, card in E:, one ZIP per clip into D:\\deliveries
   python scripts\\ingest_sd_card.py --drive E: --collector alice01 \\
-      --country US --environment residential/laundry \\
-      --calibration cal\\unit-aa3d26ba.json --out D:\\deliveries
+      --country US --calibration cal\\unit-aa3d26ba.json --out D:\\deliveries
 
   # Auto-detect the card, add a task description
   python scripts/ingest_sd_card.py --collector bob02 --country GB \\
-      --environment commercial/hospitality_housekeeping \\
       --task "strip and remake guest room" --out ./deliveries
 
   # See what would happen without writing anything
   python scripts/ingest_sd_card.py --drive E: --collector alice01 \\
-      --country US --environment residential/laundry --dry-run
-
-known environment values (from the collection spec; other values are
-accepted with a warning):
-""" + "\n".join(
-            "  %-12s %s" % (t, ", ".join(subs))
-            for t, subs in ENVIRONMENTS.items()
-        ),
+      --country US --dry-run
+""",
     )
 
     src = p.add_argument_group("source")
@@ -1434,12 +1377,6 @@ accepted with a warning):
                      help="Unique identifier for the person collecting.")
     req.add_argument("--country", required=True, metavar="CC",
                      help="Geographic location, country (e.g. US, GB, IN).")
-    req.add_argument("--environment", required=True, type=parse_environment,
-                     metavar="TYPE/SUB",
-                     help="Environment type and sub-category, "
-                          "e.g. residential/laundry. Any value is accepted; "
-                          "values outside the spec list below warn but still "
-                          "package.")
 
     opt = p.add_argument_group("optional metadata")
     opt.add_argument("--region", metavar="NAME",
@@ -1448,9 +1385,6 @@ accepted with a warning):
                      help='High-level task description, e.g. "dishes cleanup".')
     opt.add_argument("--task-labels", metavar="A,B,C",
                      help="Comma-separated low-level action labels.")
-    opt.add_argument("--env-note", metavar="TEXT",
-                     help="Free-text note, required when sub-category "
-                          "is 'other'.")
     opt.add_argument("--participant-id", metavar="ID",
                      help="Participant identifier, if distinct from the "
                           "collector.")
@@ -1460,14 +1394,6 @@ accepted with a warning):
                      help="Date the footage was captured. Defaults to today; "
                           "the camera has no real-time clock, so this cannot "
                           "be read from the card.")
-    opt.add_argument("--mount", default="head_forehead",
-                     metavar="DESC",
-                     help="Mounting position on the body "
-                          "(default: head_forehead).")
-    opt.add_argument("--orientation", default="downward",
-                     metavar="DESC",
-                     help="Camera orientation (default: downward, for hand "
-                          "visibility).")
 
     cal = p.add_argument_group("camera geometry")
     cal.add_argument("--calibration", metavar="FILE",
@@ -1509,22 +1435,6 @@ def main(argv=None):
     log = Log(args.quiet)
     we_mounted = []                # volumes this run attached, to detach after
 
-    args.env_type, args.env_subcategory = args.environment
-    # The collection spec's known taxonomy is advisory: warn on anything
-    # outside it (likely a typo, or a custom environment worth a note) but
-    # never block -- the operator may legitimately be collecting elsewhere.
-    if args.env_type not in ENVIRONMENTS:
-        log.warn("environment type '%s' is outside the collection spec "
-                 "(expected one of: %s). Packaging it anyway."
-                 % (args.env_type, ", ".join(sorted(ENVIRONMENTS))))
-    elif args.env_subcategory not in ENVIRONMENTS[args.env_type]:
-        log.warn("'%s' is not a listed %s sub-category (expected one of: %s). "
-                 "Packaging it anyway."
-                 % (args.env_subcategory, args.env_type,
-                    ", ".join(ENVIRONMENTS[args.env_type])))
-    if args.env_subcategory in ("other", "other_household") and not args.env_note:
-        log.warn("sub-category is '%s' but no --env-note was given"
-                 % args.env_subcategory)
     if not args.capture_date:
         args.capture_date = _dt.date.today().isoformat()
         log.warn("no --capture-date given; using today (%s). The camera has "

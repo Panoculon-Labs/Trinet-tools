@@ -237,9 +237,8 @@ programs that require per-video metadata and enforce quality thresholds.
 ```bash
 # Windows: card in E:, ZIPs into D:\deliveries
 python scripts\ingest_sd_card.py --drive E: --collector alice01 ^
-    --country US --environment residential/laundry ^
-    --capture-date 2026-07-20 --calibration cal\unit-aa3d26ba.json ^
-    --out D:\deliveries
+    --country US --capture-date 2026-07-20 ^
+    --calibration cal\unit-aa3d26ba.json --out D:\deliveries
 ```
 
 ```
@@ -261,7 +260,7 @@ and extrinsics, with a properly computed fisheye field of view.
 byte for byte. **Standard-library Python 3 only**, no `pip install` and no
 `ffmpeg`.
 
-Full guide, including the environment taxonomy, head-frame extrinsics and how
+Full guide, including the metadata field mapping, head-frame extrinsics and how
 the card is found and mounted:
 [`docs/data_collection_packaging.md`](docs/data_collection_packaging.md).
 

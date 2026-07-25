@@ -26,7 +26,6 @@ Install Python 3 from [python.org](https://www.python.org/downloads/) (tick
 python scripts\ingest_sd_card.py --drive E: ^
     --collector alice01 ^
     --country US ^
-    --environment residential/laundry ^
     --capture-date 2026-07-20 ^
     --calibration cal\unit-aa3d26ba.json ^
     --out D:\deliveries
@@ -38,7 +37,6 @@ python scripts\ingest_sd_card.py --drive E: ^
 python3 scripts/ingest_sd_card.py --drive /Volumes/TRINET \
     --collector alice01 \
     --country US \
-    --environment residential/laundry \
     --capture-date 2026-07-20 \
     --calibration cal/unit-aa3d26ba.json \
     --out ~/deliveries
@@ -82,13 +80,11 @@ IMU metadata.
   "clip_id": "grp10580_329b911e_1",
   "collector_id": "alice01",
   "session_id": "alice01-20260722-329b911e-s10580",
-  "environment": { "type": "residential", "subcategory": "laundry" },
   "location": { "country": "IN", "region": "Bhopal" },
   "capture": { "date": "2026-07-22" },
   "camera": {
     "make": "Panoculon Labs", "model": "Trinet",
     "device_id": "329b911ecd8c67e288d969f92ca8d4d1",
-    "placement": { "mount": "head_forehead", "orientation": "downward" },
     "intrinsics": {
       "image_size": [1920, 1080],
       "projection_model": "equidistant",
@@ -131,7 +127,6 @@ IMU metadata.
 
 | Spec row | metadata.json |
 |---|---|
-| Environment Type | `environment.type` + `environment.subcategory` |
 | Geographic Location | `location.country` (+ optional `region`) |
 | User ID / Session ID | `collector_id` / `session_id` |
 | Camera Resolution / Frame Rate | `video.resolution_mp` / `video.nominal_fps` |
@@ -144,7 +139,6 @@ IMU metadata.
 | GOP Length | `video.gop_length` |
 | B-Frames | `video.b_frames` |
 | Clip Length | `duration_s` / `video.duration_s` |
-| Mounting Position / Orientation | `camera.placement.mount` / `.orientation` |
 | Camera Intrinsics (focal length) | `camera.intrinsics.focal_length_px` |
 | Camera Intrinsics (distortion) | `camera.intrinsics.distortion_coefficients` |
 | Camera Extrinsics (position/orientation vs head) | `camera.extrinsics.head_frame` |
@@ -158,8 +152,8 @@ for H.264 recordings. `camera.intrinsics`, `camera.diagonal_fov_deg` and
 `camera.extrinsics` need `--calibration`; without it they are `null` with a
 note. `camera.extrinsics.head_frame` carries the camera's position and
 orientation relative to the head frame when `--head-transform` is supplied.
-Optional flags (`--region`, `--task`, `--task-labels`, `--participant-id`,
-`--env-note`) add their own keys; keys you did not supply are simply absent.
+Optional flags (`--region`, `--task`, `--task-labels`, `--participant-id`)
+add their own keys; keys you did not supply are simply absent.
 
 ## Required flags
 
@@ -167,27 +161,6 @@ Optional flags (`--region`, `--task`, `--task-labels`, `--participant-id`,
 |---|---|
 | `--collector ID` | Unique identifier for the person collecting. Also seeds the per-session id. |
 | `--country CC` | Geographic location (country). |
-| `--environment TYPE/SUB` | Environment type and sub-category (below). |
-
-### Environment values
-
-`--environment` takes `type/sub-category`. The categories below are the ones
-named in the collection specification:
-
-| Type | Sub-categories |
-|---|---|
-| `residential` | `laundry`, `kitchen_tidy`, `organize_room`, `other_household` |
-| `commercial` | `agriculture_landscaping_grounds`, `hospitality_housekeeping`, `automotive_service_maintenance`, `food_service_back_of_house`, `field_services_light_installation`, `commercial_cleaning_janitorial`, `retail_stocking_back_of_house`, `construction_skilled_trades`, `other` |
-
-These are **not enforced**: any `type/sub-category` is accepted. A value
-outside the list above is packaged anyway, with a warning so an accidental typo
-does not slip through silently — useful when you are collecting somewhere the
-spec does not name (e.g. `commercial/other` with a note, or an internal
-`lab/assembly`). Spaces and dashes in the sub-category are normalised to
-underscores, so `"commercial/Back of House"` becomes `commercial/back_of_house`.
-
-Use `--env-note` to describe anything filed under an `other` (or custom)
-sub-category.
 
 ## Camera geometry
 
