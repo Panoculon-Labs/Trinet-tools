@@ -174,16 +174,21 @@ pipeline — with `--calibration`:
 --calibration cal/unit-aa3d26ba.json
 ```
 
-The script inlines the intrinsics into every `metadata.json` and computes the
-**diagonal field of view** from them. For fisheye (`equidistant`) lenses it
-inverts the full distortion polynomial numerically rather than assuming a
-linear mapping, so the figure is the real optical FOV rather than an estimate.
+Both `calibration.json` layouts the pipeline emits are accepted: the flat
+single-camera form (`{"intrinsics": …, "extrinsics": {"T_cam_imu": …}, …}`) and
+the multi-camera form (`{"cameras": [ … ], "T_cam0_imu": …}`, `--camera-index`
+picks the camera; 0 = the scene-left eye).
+
+The script inlines the intrinsics into every `metadata.json` and records the
+**diagonal field of view**. It uses the calibration's own `fov_deg` when present
+and otherwise computes it — for fisheye lenses by inverting the full distortion
+polynomial numerically, not a linear approximation. When the calibration carries
+a horizontal/vertical/diagonal breakdown it is copied to `camera.fov_deg`
+(useful because, for wide fisheye lenses, the horizontal FOV is far more stable
+across units than the diagonal).
 
 Without `--calibration` the script warns and the intrinsics/extrinsics keys are
 absent, which for most programs means the submission is incomplete.
-
-For stereo units, `--camera-index` selects which camera in the file (0 = the
-scene-left eye).
 
 ### Batch vs per-device calibration
 

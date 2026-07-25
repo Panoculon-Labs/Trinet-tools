@@ -843,33 +843,60 @@ def diagonal_fov_deg(intr):
 
 
 def load_calibration(path, cam_index, log):
+    """Load a calibration.json in either of the two formats the pipeline emits.
+
+    - Flat single-camera: {"intrinsics": {...}, "extrinsics": {"T_cam_imu": ...},
+      "imu": {...}}  -- the per-unit / batch Trinet-Calibration output.
+    - Multi-camera:   {"cameras": [ {intrinsics, ...}, ... ], "T_cam0_imu": ...}
+      -- the stereo layout; `cam_index` selects the camera.
+    """
     with open(path, "r", encoding="utf-8") as f:
         cal = json.load(f)
-    cams = cal.get("cameras") or []
-    if not cams:
-        raise ValueError("calibration has no 'cameras' array")
-    if cam_index >= len(cams):
-        raise ValueError(
-            "camera index %d out of range (file has %d)" % (cam_index, len(cams))
-        )
-    cam = cams[cam_index]
-    intr = dict(cam.get("intrinsics") or {})
-    fov, method = diagonal_fov_deg(intr)
+
+    if cal.get("cameras"):
+        cams = cal["cameras"]
+        if cam_index >= len(cams):
+            raise ValueError("camera index %d out of range (file has %d)"
+                             % (cam_index, len(cams)))
+        cam = cams[cam_index]
+        intr = dict(cam.get("intrinsics") or {})
+        t_cam_imu = cal.get("T_cam0_imu") if cam_index == 0 else None
+        timeshift = cam.get("timeshift_cam_imu_s")
+        rms = cam.get("reprojection_rms_px")
+    elif cal.get("intrinsics"):
+        intr = dict(cal["intrinsics"])
+        ext = cal.get("extrinsics") or {}
+        t_cam_imu = ext.get("T_cam_imu")
+        imu = cal.get("imu") or {}
+        timeshift = (ext.get("timeshift_cam_imu_s")
+                     or ext.get("timeshift_cam_imu_sec")
+                     or ext.get("time_offset_s")
+                     or imu.get("timeshift_cam_imu_s"))
+        rms = (intr.get("reprojection_rms_px")
+               or (intr.get("qa") or {}).get("reprojection_rms_mean_px"))
+    else:
+        raise ValueError("calibration has neither 'cameras' nor 'intrinsics'")
+
+    # Prefer the calibration's own diagonal FOV; fall back to computing it.
+    fov = _round((intr.get("fov_deg") or {}).get("diagonal"), 1)
+    method = "from calibration file"
     if fov is None:
-        log.warn("could not compute field of view: %s" % method)
+        fov_c, method = diagonal_fov_deg(intr)
+        fov = _round(fov_c, 1)
+        if fov is None:
+            log.warn("could not determine field of view: %s" % method)
 
     out = {
         "source_file": os.path.basename(path),
         "camera_index": cam_index,
         "intrinsics": intr,
-        "diagonal_fov_deg": _round(fov, 1),
+        "diagonal_fov_deg": fov,
         "diagonal_fov_method": method if fov is not None else None,
-        "timeshift_cam_imu_s": cam.get("timeshift_cam_imu_s"),
-        "reprojection_rms_px": cam.get("reprojection_rms_px"),
+        "timeshift_cam_imu_s": timeshift,
+        "reprojection_rms_px": rms,
     }
-    t = cal.get("T_cam0_imu")
-    if t:
-        out["T_cam_imu"] = t
+    if t_cam_imu:
+        out["T_cam_imu"] = t_cam_imu
         out["T_cam_imu_note"] = (
             "4x4 row-major camera-from-inertial transform; translation in metres"
         )
@@ -1344,7 +1371,9 @@ def build_metadata(clip, args, calib, head):
         meta["camera"]["diagonal_fov_deg"] = round(args.fov_deg, 1)
         meta["camera"]["diagonal_fov_source"] = "stated (--fov-deg)"
     elif meta["camera"].get("diagonal_fov_deg") is not None:
-        meta["camera"]["diagonal_fov_source"] = "computed from calibration"
+        meta["camera"]["diagonal_fov_source"] = (
+            calib.get("diagonal_fov_method") if calib else None
+        ) or "computed from calibration"
     else:
         meta["camera"]["diagonal_fov_deg"] = None
         meta["camera"]["diagonal_fov_note"] = (
@@ -1452,6 +1481,13 @@ def _apply_calibration(cam, calib, head, args):
     named["distortion_coefficients"] = intr.get("distortion")  # spec: Distortion
     cam["intrinsics"] = named
     cam["diagonal_fov_deg"] = calib["diagonal_fov_deg"]        # spec: FOV
+    # Full H/V/D breakdown when the calibration carries it (the diagonal is the
+    # spec field; horizontal is the more stable metric for wide fisheye lenses).
+    fov = intr.get("fov_deg")
+    if isinstance(fov, dict):
+        cam["fov_deg"] = {k: _round(fov.get(k), 1) for k in
+                          ("horizontal", "vertical", "diagonal")
+                          if fov.get(k) is not None}
     cam["calibration_source"] = calib["source_file"]
 
     # Whether this calibration is for the exact unit or a batch representative.
