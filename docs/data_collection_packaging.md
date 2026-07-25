@@ -171,14 +171,23 @@ Optional flags (`--region`, `--task`, `--task-labels`, `--participant-id`,
 
 ### Environment values
 
-`--environment` takes `type/sub-category`, validated against this list:
+`--environment` takes `type/sub-category`. The categories below are the ones
+named in the collection specification:
 
 | Type | Sub-categories |
 |---|---|
 | `residential` | `laundry`, `kitchen_tidy`, `organize_room`, `other_household` |
 | `commercial` | `agriculture_landscaping_grounds`, `hospitality_housekeeping`, `automotive_service_maintenance`, `food_service_back_of_house`, `field_services_light_installation`, `commercial_cleaning_janitorial`, `retail_stocking_back_of_house`, `construction_skilled_trades`, `other` |
 
-Use `--env-note` to describe anything filed under an `other` sub-category.
+These are **not enforced**: any `type/sub-category` is accepted. A value
+outside the list above is packaged anyway, with a warning so an accidental typo
+does not slip through silently — useful when you are collecting somewhere the
+spec does not name (e.g. `commercial/other` with a note, or an internal
+`lab/assembly`). Spaces and dashes in the sub-category are normalised to
+underscores, so `"commercial/Back of House"` becomes `commercial/back_of_house`.
+
+Use `--env-note` to describe anything filed under an `other` (or custom)
+sub-category.
 
 ## Camera geometry
 

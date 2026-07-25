@@ -1370,19 +1370,18 @@ def package(clip, args, calib, head, log):
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_environment(value):
+    """Split TYPE/SUBCATEGORY. Any values are accepted; the known collection
+    taxonomy is only used to warn (in main), never to reject -- custom
+    environments are a legitimate case the spec allows via "other"."""
     if "/" not in value:
         raise argparse.ArgumentTypeError(
             "use TYPE/SUBCATEGORY, e.g. residential/laundry")
     etype, sub = value.split("/", 1)
-    etype, sub = etype.strip().lower(), sub.strip().lower()
-    if etype not in ENVIRONMENTS:
+    etype = etype.strip().lower()
+    sub = sub.strip().lower().replace(" ", "_").replace("-", "_")
+    if not etype or not sub:
         raise argparse.ArgumentTypeError(
-            "environment type must be one of: %s"
-            % ", ".join(sorted(ENVIRONMENTS)))
-    if sub not in ENVIRONMENTS[etype]:
-        raise argparse.ArgumentTypeError(
-            "sub-category for '%s' must be one of: %s"
-            % (etype, ", ".join(ENVIRONMENTS[etype])))
+            "both TYPE and SUBCATEGORY are required, e.g. residential/laundry")
     return etype, sub
 
 
@@ -1414,7 +1413,8 @@ def build_parser():
   python scripts/ingest_sd_card.py --drive E: --collector alice01 \\
       --country US --environment residential/laundry --dry-run
 
-environment values:
+known environment values (from the collection spec; other values are
+accepted with a warning):
 """ + "\n".join(
             "  %-12s %s" % (t, ", ".join(subs))
             for t, subs in ENVIRONMENTS.items()
@@ -1437,7 +1437,9 @@ environment values:
     req.add_argument("--environment", required=True, type=parse_environment,
                      metavar="TYPE/SUB",
                      help="Environment type and sub-category, "
-                          "e.g. residential/laundry. See list below.")
+                          "e.g. residential/laundry. Any value is accepted; "
+                          "values outside the spec list below warn but still "
+                          "package.")
 
     opt = p.add_argument_group("optional metadata")
     opt.add_argument("--region", metavar="NAME",
@@ -1508,6 +1510,18 @@ def main(argv=None):
     we_mounted = []                # volumes this run attached, to detach after
 
     args.env_type, args.env_subcategory = args.environment
+    # The collection spec's known taxonomy is advisory: warn on anything
+    # outside it (likely a typo, or a custom environment worth a note) but
+    # never block -- the operator may legitimately be collecting elsewhere.
+    if args.env_type not in ENVIRONMENTS:
+        log.warn("environment type '%s' is outside the collection spec "
+                 "(expected one of: %s). Packaging it anyway."
+                 % (args.env_type, ", ".join(sorted(ENVIRONMENTS))))
+    elif args.env_subcategory not in ENVIRONMENTS[args.env_type]:
+        log.warn("'%s' is not a listed %s sub-category (expected one of: %s). "
+                 "Packaging it anyway."
+                 % (args.env_subcategory, args.env_type,
+                    ", ".join(ENVIRONMENTS[args.env_type])))
     if args.env_subcategory in ("other", "other_household") and not args.env_note:
         log.warn("sub-category is '%s' but no --env-note was given"
                  % args.env_subcategory)
