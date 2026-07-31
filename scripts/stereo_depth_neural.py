@@ -128,6 +128,9 @@ def main():
                     help="force CPUExecutionProvider")
     ap.add_argument("--compare-sgbm", action="store_true",
                     help="render an SGBM panel next to the HITNet one")
+    ap.add_argument("--compare-wls", action="store_true",
+                    help="the comparison panel is WLS-filtered SGBM "
+                         "(needs cv2.ximgproc) instead of raw SGBM")
     ap.add_argument("--min-depth", type=float, default=0.25)
     ap.add_argument("--max-depth", type=float, default=6.0)
     ap.add_argument("--fps", type=float, default=30.0)
@@ -175,8 +178,8 @@ def main():
     baseline = rect.baseline_m
     print(f"baseline {baseline*1000:.1f} mm, fx(model) {fx_model:.1f} px")
 
-    sgbm = None
-    if args.compare_sgbm:
+    sgbm = wls = matcher_r = None
+    if args.compare_sgbm or args.compare_wls:
         nd = (args.num_disp + 15) // 16 * 16
         sgbm = cv2.StereoSGBM_create(
             minDisparity=0, numDisparities=nd, blockSize=5,
@@ -184,6 +187,13 @@ def main():
             disp12MaxDiff=1, uniquenessRatio=10,
             speckleWindowSize=120, speckleRange=2,
             preFilterCap=31, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
+    if args.compare_wls:
+        if not hasattr(cv2, "ximgproc"):
+            sys.exit("--compare-wls needs opencv-contrib-python (cv2.ximgproc)")
+        matcher_r = cv2.ximgproc.createRightMatcher(sgbm)
+        wls = cv2.ximgproc.createDisparityWLSFilter(matcher_left=sgbm)
+        wls.setLambda(8000.0)
+        wls.setSigmaColor(1.2)
 
     pw, ph = net.w // 2 * 2, net.h // 2 * 2  # render at model res
     pw, ph = pw // 2, ph // 2                # half-size tiles, 2x2 canvas
@@ -228,8 +238,15 @@ def main():
         if sgbm is not None:
             gl = cv2.cvtColor(rl, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(rr, cv2.COLOR_BGR2GRAY)
-            sdisp = sgbm.compute(gl, gr).astype(np.float32) / 16.0
-            panels.append((color_sgbm(sdisp), "SGBM depth"))
+            d16 = sgbm.compute(gl, gr)
+            if wls is not None:
+                d16r = matcher_r.compute(gr, gl)
+                d16 = wls.filter(d16, gl, disparity_map_right=d16r)
+                sdisp = d16.astype(np.float32) / 16.0
+                panels.append((color_sgbm(sdisp), "SGBM+WLS depth"))
+            else:
+                sdisp = d16.astype(np.float32) / 16.0
+                panels.append((color_sgbm(sdisp), "SGBM depth"))
 
         canvas = compose_canvas(rl, rr, panels, legend, pw, ph,
                                 strip.render(ts) if strip else None)

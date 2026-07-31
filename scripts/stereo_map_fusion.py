@@ -90,7 +90,14 @@ def main():
     ap.add_argument("--no-clean", action="store_true",
                     help="skip the post-extraction outlier/small-cluster "
                          "cleanup")
+    ap.add_argument("--wls", action="store_true",
+                    help="SGBM + WLS-filtered disparity, gated by the WLS "
+                         "confidence map (>= 0.5) so interpolated regions "
+                         "don't integrate as fake surfaces. Needs "
+                         "cv2.ximgproc. Mutually exclusive with --neural.")
     args = ap.parse_args()
+    if args.wls and args.neural:
+        ap.error("--wls and --neural are mutually exclusive")
 
     import open3d as o3d
 
@@ -202,6 +209,15 @@ def main():
         P1=8 * 3 * 49, P2=32 * 3 * 49, disp12MaxDiff=1, uniquenessRatio=15,
         speckleWindowSize=200, speckleRange=1, preFilterCap=31,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
+    wls = matcher_r = None
+    if args.wls:
+        if not hasattr(cv2, "ximgproc"):
+            sys.exit("--wls needs opencv-contrib-python (cv2.ximgproc)")
+        matcher_r = cv2.ximgproc.createRightMatcher(sgbm)
+        wls = cv2.ximgproc.createDisparityWLSFilter(matcher_left=sgbm)
+        wls.setLambda(8000.0)
+        wls.setSigmaColor(1.2)
+        print("[wls] SGBM + WLS, confidence-gated (>= 0.5)")
 
     caps = (cv2.VideoCapture(str(mp4_l)), cv2.VideoCapture(str(mp4_r)))
     cur = [-1, -1]
@@ -263,7 +279,17 @@ def main():
             gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
             d16 = sgbm.compute(gl, gr)
-            disp = cv2.medianBlur(d16.astype(np.float32) / 16.0, 5)
+            if wls is not None:
+                d16r = matcher_r.compute(gr, gl)
+                d16f = wls.filter(d16, gl, disparity_map_right=d16r)
+                conf = wls.getConfidenceMap()
+                disp = d16f.astype(np.float32) / 16.0
+                # WLS interpolates unmatched regions along view rays; the
+                # confidence map marks where the fill is guesswork — those
+                # pixels stay out of the volume.
+                disp[conf < 0.5 * 255.0] = 0
+            else:
+                disp = cv2.medianBlur(d16.astype(np.float32) / 16.0, 5)
         depth = np.zeros_like(disp)
         good = disp > 0.5
         depth[good] = fx_depth * rect.baseline_m / disp[good]
