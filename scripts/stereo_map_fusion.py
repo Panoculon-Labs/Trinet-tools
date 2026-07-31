@@ -3,10 +3,12 @@
 # Copyright (c) 2026 Panoculon Labs. Part of Trinet-Tools.
 """Dense 3D map from a Trinet stereo take + a VIO/SLAM trajectory.
 
-Fuses per-frame metric stereo depth (SGBM, WLS-filtered when
-opencv-contrib is present) along the estimated trajectory into a TSDF
-volume (Open3D) and extracts a colored mesh / point cloud — the "full 3D
-map" a sparse VIO run doesn't give you by itself.
+Fuses per-frame metric stereo depth along the estimated trajectory into a
+TSDF volume (Open3D) and extracts a colored mesh / point cloud — the "full
+3D map" a sparse VIO run doesn't give you by itself. Depth is SGBM by
+default; --neural switches to HITNet (GPU, scripts/stereo_depth_neural.py)
+with a left-right consistency gate, which fills the textureless surfaces
+SGBM leaves as holes while still keeping guessed pixels out of the volume.
 
 Inputs: the take's two MP4s (calibration + timing embedded; sidecars used
 when present) and the trajectory from scripts/run_openvins.sh
@@ -71,6 +73,16 @@ def main():
     ap.add_argument("--max-gyro-dps", type=float, default=25.0,
                     help="skip keyframes rotating faster than this — "
                          "motion-blurred depth integrates as spray (0 = off)")
+    ap.add_argument("--neural", action="store_true",
+                    help="HITNet disparity (GPU) instead of SGBM, with a "
+                         "left-right consistency check so only cross-"
+                         "validated pixels enter the volume")
+    ap.add_argument("--model", type=Path,
+                    default=Path(__file__).resolve().parent.parent / "models"
+                    / "hitnet" / "hitnet_mb_720x1280.onnx")
+    ap.add_argument("--lr-thresh", type=float, default=1.5,
+                    help="max |disp_L - disp_R| (px, model scale) for the "
+                         "--neural consistency check")
     args = ap.parse_args()
 
     import open3d as o3d
@@ -151,7 +163,23 @@ def main():
 
     fx, fy = rect.P1[0, 0], rect.P1[1, 1]
     cx, cy = rect.P1[0, 2], rect.P1[1, 2]
-    intr = o3d.camera.PinholeCameraIntrinsic(1920, 1080, fx, fy, cx, cy)
+
+    net = None
+    if args.neural:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from stereo_depth_neural import HitnetMatcher
+        net = HitnetMatcher(args.model)
+        print(f"[neural] {args.model.name} on {net.provider} "
+              f"({net.w}x{net.h}, LR gate {args.lr_thresh} px)")
+        # Depth images are produced at model resolution — scale the TSDF
+        # intrinsic to match.
+        sx, sy = net.w / 1920.0, net.h / 1080.0
+        intr = o3d.camera.PinholeCameraIntrinsic(
+            net.w, net.h, fx * sx, fy * sy, cx * sx, cy * sy)
+        fx_depth = fx * sx
+    else:
+        intr = o3d.camera.PinholeCameraIntrinsic(1920, 1080, fx, fy, cx, cy)
+        fx_depth = rect.fx
     vol = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=args.voxel, sdf_trunc=args.voxel * 4,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
@@ -198,13 +226,28 @@ def main():
 
         left = rect.remap(frame[0], "L")
         right = rect.remap(frame[1], "R")
-        gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
-        gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
-        d16 = sgbm.compute(gl, gr)
-        disp = cv2.medianBlur(d16.astype(np.float32) / 16.0, 5)
+        if net is not None:
+            left = cv2.resize(left, (net.w, net.h))
+            right = cv2.resize(right, (net.w, net.h))
+            disp = net(left, right)
+            # Left-right consistency: HITNet is dense even where it's
+            # guessing (occlusions, off-image matches). Compute the
+            # right-reference disparity by mirroring both eyes, warp it to
+            # the left view, and keep only pixels where the two agree —
+            # the neural analogue of SGBM's uniqueness/disp12 checks.
+            disp_r = net(cv2.flip(right, 1), cv2.flip(left, 1))[:, ::-1]
+            xs = np.arange(net.w)[None, :].repeat(net.h, 0)
+            xr = np.clip(np.rint(xs - disp).astype(np.int32), 0, net.w - 1)
+            dr_at = np.take_along_axis(disp_r, xr, axis=1)
+            disp[np.abs(disp - dr_at) > args.lr_thresh] = 0
+        else:
+            gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+            gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+            d16 = sgbm.compute(gl, gr)
+            disp = cv2.medianBlur(d16.astype(np.float32) / 16.0, 5)
         depth = np.zeros_like(disp)
         good = disp > 0.5
-        depth[good] = rect.fx * rect.baseline_m / disp[good]
+        depth[good] = fx_depth * rect.baseline_m / disp[good]
         depth[(depth < args.min_depth) | (depth > args.max_depth)] = 0
 
         T_G_I = np.eye(4)
