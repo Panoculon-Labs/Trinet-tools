@@ -83,6 +83,13 @@ def main():
     ap.add_argument("--lr-thresh", type=float, default=1.5,
                     help="max |disp_L - disp_R| (px, model scale) for the "
                          "--neural consistency check")
+    ap.add_argument("--edge-grad", type=float, default=4.0,
+                    help="drop pixels whose local disparity gradient exceeds "
+                         "this (px/px) — kills 'flying pixel' spray at depth "
+                         "discontinuities (0 = off)")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="skip the post-extraction outlier/small-cluster "
+                         "cleanup")
     args = ap.parse_args()
 
     import open3d as o3d
@@ -240,6 +247,18 @@ def main():
             xr = np.clip(np.rint(xs - disp).astype(np.int32), 0, net.w - 1)
             dr_at = np.take_along_axis(disp_r, xr, axis=1)
             disp[np.abs(disp - dr_at) > args.lr_thresh] = 0
+            if args.edge_grad > 0:
+                # Flying-pixel gate: at depth discontinuities the matcher
+                # blends foreground and background disparities into points
+                # that hover in free space. High local disparity gradient
+                # marks exactly those pixels — drop them (plus a 1-px
+                # dilation so the blended border goes too).
+                gx = cv2.Sobel(disp, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(disp, cv2.CV_32F, 0, 1, ksize=3)
+                edge = (np.abs(gx) + np.abs(gy)) > args.edge_grad * 8.0
+                edge = cv2.dilate(edge.astype(np.uint8),
+                                  np.ones((3, 3), np.uint8)) > 0
+                disp[edge] = 0
         else:
             gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
@@ -270,6 +289,20 @@ def main():
     print(f"integrated {used} keyframes")
 
     mesh = vol.extract_triangle_mesh()
+    if not args.no_clean:
+        # Floaters are small disconnected islands: TSDF voxels seen by only
+        # a frame or two of leaked depth. Real surfaces (walls, desks) form
+        # large connected components — keep only components above ~2000
+        # triangles (at 2-3 cm voxels that is roughly a 20x20 cm patch).
+        tri_clusters, tri_count, _ = mesh.cluster_connected_triangles()
+        tri_clusters = np.asarray(tri_clusters)
+        tri_count = np.asarray(tri_count)
+        small = tri_count[tri_clusters] < 2000
+        mesh.remove_triangles_by_mask(small)
+        mesh.remove_unreferenced_vertices()
+        print(f"  [clean] dropped {int(small.sum())} triangles in "
+              f"{int((tri_count < 2000).sum())} small clusters "
+              f"({len(tri_count)} total)")
     mesh.compute_vertex_normals()
     o3d.io.write_triangle_mesh(f"{prefix}_map.ply", mesh)
     print(f"wrote {prefix}_map.ply "
@@ -280,6 +313,9 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     pcd = vol.extract_point_cloud().voxel_down_sample(args.voxel * 1.5)
+    if not args.no_clean and len(pcd.points) > 1000:
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20,
+                                                std_ratio=1.8)
     P = np.asarray(pcd.points)
     C = np.clip(np.asarray(pcd.colors), 0.0, 1.0)
     if len(P) > 150000:
