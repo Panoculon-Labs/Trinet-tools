@@ -110,11 +110,15 @@ def main():
 
     sc = smooth(centers)
     sf = smooth(fwd)
-    up = np.array([0.0, 0.0, 1.0])
-    # use the dominant plane normal of the path as up (world may be tilted)
+    # world up = dominant plane normal of the path, SIGNED by the consensus
+    # of the cameras' own up directions (image-up = -y_cam in world) — the
+    # unsigned eigenvector can point down, which flips the render 180°.
     cc = centers - centers.mean(0)
     w_, V = np.linalg.eigh(cc.T @ cc)
-    up = V[:, 0] if abs(V[:, 0] @ up) > 0.3 else up
+    up = V[:, 0]
+    votes = np.stack([np.linalg.inv(T)[:3, 1] for T in Ts]).mean(0)
+    if up @ (-votes) < 0:
+        up = -up
 
     ff = subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
