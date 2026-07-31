@@ -22,3 +22,6 @@ out/
 *.h264
 
 .claude/
+
+# Neural stereo model weights (fetch per models/hitnet/README.md)
+models/**/*.onnx
