@@ -200,6 +200,7 @@ def main():
     parser.add_argument("--end", type=float, default=0, help="End time in seconds (0 = full)")
     parser.add_argument("--plots", type=str, default="orientation,accel,gyro,mag,sync_delay",
                         help="Comma-separated: orientation,accel,gyro,mag,temp,sync_delay")
+    parser.add_argument("--watermark", default="", help="watermark text (bottom-right)")
     parser.add_argument(
         "--orientation",
         choices=("madgwick", "gyro"),
@@ -509,6 +510,12 @@ def main():
                            sync_delay_frame_times, per_frame_delay_plot, t_s, T_WINDOW,
                            title_sd, "us", [""], [(100, 220, 255)])
             slot += 1
+
+        if args.watermark:
+            (tw, _), _ = cv2.getTextSize(args.watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            wx, wy = OUT_W - tw - 14, OUT_H - 12
+            cv2.putText(canvas, args.watermark, (wx + 1, wy + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, args.watermark, (wx, wy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
         writer.write(canvas)
 
