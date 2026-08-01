@@ -26,6 +26,10 @@ Usage:
     # live preview instead of writing a file
     python scripts/sync_view.py head.mp4 wristL.mp4 --show
 
+    # upside-down-mounted wrist cams: flip those panels, and brand the output
+    python scripts/sync_view.py wristL.mp4 head.mp4 wristR.mp4 \
+        --rotate180 0,2 --watermark "Panoculon Labs" -o take.mp4
+
 Reads:  <rec>.mp4 + <rec>.vts (+ optional <rec>.json for labels), or a chunk
         directory containing partNNN.{mp4,vts}.
 Outputs: a side-by-side .mp4 (default <first>_sync.mp4), or a live window.
@@ -183,6 +187,7 @@ def _put(img, text, org, scale=0.5, color=FG, thick=1):
 
 
 def render(cams, args):
+    rotate_set = {int(i) for i in args.rotate180.split(",") if i.strip() != ""}
     # Common timeline = overlap of all cameras on the global clock.
     t0 = max(c.t_start for c in cams)
     t1 = min(c.t_end for c in cams)
@@ -250,7 +255,8 @@ def render(cams, args):
             pw = panel_w[ci]
             cell = canvas[HEADER_H:HEADER_H + args.height, x:x + pw]
             if frames[ci] is not None:
-                cv2.resize(frames[ci], (pw, args.height), dst=cell, interpolation=cv2.INTER_AREA)
+                fr_disp = cv2.rotate(frames[ci], cv2.ROTATE_180) if ci in rotate_set else frames[ci]
+                cv2.resize(fr_disp, (pw, args.height), dst=cell, interpolation=cv2.INTER_AREA)
             # per-panel label strip: offset from the reference (master) camera.
             ly = HEADER_H + args.height
             cv2.rectangle(canvas, (x, ly), (x + pw, ly + LABEL_H), (40, 40, 40), -1)
@@ -268,6 +274,12 @@ def render(cams, args):
         q = max((c.quality_us for c in cams), default=0)
         _put(canvas, f"sync ~{q} us  |  cross-cam {spread_ms:+5.2f} ms",
              (total_w - 360, 23), 0.5, ACCENT if spread_ms < 2.0 else WARN)
+
+        if args.watermark:
+            (tw, _), _ = cv2.getTextSize(args.watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            wx, wy = total_w - tw - 14, HEADER_H + args.height - 12
+            cv2.putText(canvas, args.watermark, (wx + 1, wy + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, args.watermark, (wx, wy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
         if args.show:
             cv2.imshow("trinet sync view", canvas)
@@ -336,6 +348,10 @@ def main():
     ap.add_argument("-o", "--output", help="output .mp4 (default <first>_sync.mp4)")
     ap.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
     ap.add_argument("--height", type=int, default=480, help="panel height px (default 480)")
+    ap.add_argument("--rotate180", default="",
+                    help="comma list of 0-based panel indices whose video to rotate 180 "
+                         "(e.g. inverted-mounted wrist cams): --rotate180 0,2")
+    ap.add_argument("--watermark", default="", help="watermark text (bottom-right of the video area)")
     ap.add_argument("--show", action="store_true", help="live preview instead of writing a file")
     args = ap.parse_args()
 
