@@ -625,6 +625,39 @@ def iter_imu_samples(path):
             yield ts, (ax, ay, az), (gx, gy, gz), (mx, my, mz)
 
 
+def imu_gravity(paths, nominal_rate_hz=400):
+    """Median |accel| over near-stationary windows, in m/s^2.
+
+    When the unit is still, |accel| should read gravity (~9.81). A value well
+    off that (the delivery spec accepts 9.0-10.6) means the accelerometer scale
+    is wrong -- most often a full-scale-range misconfiguration, which shows as a
+    clean ~2x or ~0.5x error. Returns (median, n_windows, min, max) or Nones.
+    """
+    rate = nominal_rate_hz or 400
+    win = max(4, int(rate * 0.25))                    # ~0.25 s blocks
+    amag, gmag = [], []
+    for p in paths:
+        for _ts, acc, gyr, _mag in iter_imu_samples(p):
+            amag.append(math.sqrt(acc[0] ** 2 + acc[1] ** 2 + acc[2] ** 2))
+            gmag.append(math.sqrt(gyr[0] ** 2 + gyr[1] ** 2 + gyr[2] ** 2))
+    n = len(amag)
+    if n < win * 2:
+        return None, 0, None, None
+    still = []
+    for i in range(0, n - win, win):
+        gseg = gmag[i:i + win]
+        aseg = amag[i:i + win]
+        if sum(gseg) / win < 0.08:                    # low rotation
+            m = sum(aseg) / win
+            if sum((x - m) ** 2 for x in aseg) / win < 0.5:   # low lin. accel
+                still.append(m)
+    if not still:
+        return None, 0, None, None
+    still.sort()
+    med = still[len(still) // 2]
+    return med, len(still), still[0], still[-1]
+
+
 def iter_vts_frames(path):
     """Yield sof_timestamp_ns for each frame entry (0 if unavailable)."""
     size = os.path.getsize(path)
@@ -1094,6 +1127,7 @@ class Clip:
         self.vts = None
         self.video = {}
         self.container = ("ok", None)
+        self.gravity = (None, 0, None, None)
         self.meta_sidecar = {}
         self.device_id_conflict = None
 
@@ -1115,6 +1149,12 @@ class Clip:
             elif got:
                 log.warn("%s: unsupported .imu version %d"
                          % (self.base, got["version"]))
+
+        # Still-window gravity: an accelerometer-scale sanity check.
+        imu_paths = self.sidecars.get("imu", [])
+        if imu_paths and self.imu:
+            self.gravity = imu_gravity(
+                imu_paths, (self.imu or {}).get("nominal_rate_hz") or 400)
 
         for path in self.sidecars.get("vts", []):
             got = read_vts(path)
@@ -1606,6 +1646,23 @@ def _imu_metadata(clip):
     imu_files = [os.path.basename(p) for p in clip.sidecars.get("imu", [])]
     sync_method = ("hardware frame-sync pulse" if imu.get("frame_sync")
                    else "shared monotonic clock")
+
+    grav_med, grav_n, grav_lo, grav_hi = getattr(
+        clip, "gravity", (None, 0, None, None))
+    accel = {                                        # Accelerometer Data
+        "range_g": imu.get("accel_range_g"),
+        "units": "m/s^2 (gravity included)",
+    }
+    if grav_med is not None:
+        # Scale sanity: at rest |accel| should read gravity (~9.81 m/s^2).
+        accel["gravity_still_ms2"] = round(grav_med, 3)
+        accel["gravity_still_windows"] = grav_n
+        accel["gravity_in_spec"] = bool(9.0 <= grav_med <= 10.6)
+        if not accel["gravity_in_spec"]:
+            accel["gravity_note"] = (
+                "off nominal 9.81 by %.2fx -- likely an accelerometer "
+                "full-scale-range misconfiguration on this unit."
+                % (grav_med / 9.81))
     return {
         "present": True,
         "data_files": imu_files,
@@ -1614,10 +1671,7 @@ def _imu_metadata(clip):
         "nominal_rate_hz": imu.get("nominal_rate_hz"),
         "sample_count": imu.get("samples"),
         "duration_s": _round(imu.get("duration_s"), 3),
-        "accelerometer": {                           # Accelerometer Data
-            "range_g": imu.get("accel_range_g"),
-            "units": "m/s^2 (gravity included)",
-        },
+        "accelerometer": accel,
         "gyroscope": {                               # Gyroscope Data
             "range_dps": imu.get("gyro_range_dps"),
             "units": "rad/s",
@@ -1904,6 +1958,11 @@ def gate_reasons(clip, args):
         st, detail = clip.container
         if st != "ok":
             reasons.append("%s video (%s)" % (st, detail))
+    if args.gate or args.require_imu_gravity:
+        g = clip.gravity[0]
+        if g is not None and not (9.0 <= g <= 10.6):
+            reasons.append("accel gravity off-scale (%.2f m/s^2, %.2fx nominal)"
+                           % (g, g / 9.81))
     return reasons
 
 
@@ -2160,9 +2219,10 @@ known environment values (others are accepted with a warning):
     gate = p.add_argument_group("quality gating (skip bad clips)")
     gate.add_argument("--gate", action="store_true",
                       help="Skip clips that would be refused: shorter than "
-                           "60 s, missing IMU, or an unreadable/truncated "
-                           "video. Shortcut for --min-duration 60 "
-                           "--require-imu --require-valid-video.")
+                           "60 s, missing IMU, an unreadable/truncated video, "
+                           "or accelerometer gravity off-scale. Shortcut for "
+                           "--min-duration 60 --require-imu "
+                           "--require-valid-video --require-imu-gravity.")
     gate.add_argument("--min-duration", type=float, default=None, metavar="SECS",
                       help="Skip clips shorter than SECS (the spec floor is "
                            "120).")
@@ -2172,6 +2232,9 @@ known environment values (others are accepted with a warning):
     gate.add_argument("--require-valid-video", action="store_true",
                       help="Skip clips whose MP4 is truncated or has no "
                            "readable video track.")
+    gate.add_argument("--require-imu-gravity", action="store_true",
+                      help="Skip clips whose at-rest accelerometer magnitude "
+                           "is outside 9.0-10.6 m/s^2 (a scale/FSR fault).")
 
     out.add_argument("--no-automount", dest="automount",
                      action="store_false",

@@ -421,14 +421,23 @@ downstream, gate on them — they are skipped and listed in
 `rejected_<collector>_<date>.json` instead of being packaged:
 
 ```bash
---gate                     # = --min-duration 60 --require-imu --require-valid-video
+--gate                     # all four checks below
 --min-duration 120         # skip clips shorter than N seconds (spec floor 120)
 --require-imu              # skip clips with no usable accel+gyro
---require-valid-video     # skip truncated / unreadable MP4s
+--require-valid-video      # skip truncated / unreadable MP4s
+--require-imu-gravity      # skip clips whose at-rest gravity is off-scale
 ```
 
 `--require-valid-video` uses the same box audit the delivery ingest does (the
 last box must end at EOF), so a clip cut mid-write is caught before it ships.
+
+`--require-imu-gravity` measures the accelerometer magnitude over
+near-stationary windows: at rest it should read gravity (~9.81 m/s²), and a
+value outside 9.0–10.6 means the accelerometer scale is wrong — usually a
+full-scale-range misconfiguration on that unit, which shows as a clean ~2× or
+~0.5× error. The measured value is always recorded in
+`metadata.json → imu.accelerometer.gravity_still_ms2` (with `gravity_in_spec`),
+whether or not you gate on it.
 
 ## Backfilling a batch that already shipped
 
