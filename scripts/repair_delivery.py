@@ -17,20 +17,21 @@ It rewrites each ZIP via a temp file + atomic replace (or writes copies with
 --out), and prints, per file, what it fixed and what still cannot pass
 (clip too short, no usable video) so those can be re-collected.
 
-    # fix metadata + IMU scale + truncated video (fast; environment defaults
-    # to residential/other_household):
+    # the full fix -- metadata + IMU scale + video (remux + re-encode to the
+    # spec bitrate). Environment defaults to residential/other_household:
     python3 repair_delivery.py  DELIVERIES/
-
-    # also transcode to the spec bitrate (<=8 Mbps); this is the full fix:
-    python3 repair_delivery.py  DELIVERIES/  --reencode
 
     # a specific environment, or per-file from a CSV:
     python3 repair_delivery.py  DELIVERIES/  --environment commercial/retail_stocking_back_of_house
-    python3 repair_delivery.py  DELIVERIES/  --map env_by_clip.csv --reencode
+    python3 repair_delivery.py  DELIVERIES/  --map env_by_clip.csv
 
-It uses every CPU core by default (one worker per core). Add --dry-run first to
-see the plan without changing anything, or --out DIR to write copies instead of
-editing in place.
+    # skip the (slower) bitrate re-encode -- just fix metadata/IMU/truncation:
+    python3 repair_delivery.py  DELIVERIES/  --no-reencode
+
+Re-encode (the bitrate fix) is ON by default and needs ffmpeg; if ffmpeg is
+absent it is skipped with a note. It uses every CPU core by default (one worker
+per core). Add --dry-run first to see the plan, or --out DIR to write copies
+instead of editing in place.
 """
 
 import argparse
@@ -312,11 +313,17 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                 status, _d = container_status_zip(z, mp4, size)
                 dur = meta.get("duration_s")
                 br = (size * 8 / dur / 1e6) if dur else None
+                ffm = have("ffmpeg")
                 need_fix = args.reencode or (status not in ("ok", "no_video"))
+                will_fix_video = need_fix and status != "no_video" and ffm
                 if status == "no_video":
                     remaining.append("no usable video (cannot repair)")
-                elif need_fix and not have("ffmpeg"):
+                elif need_fix and not ffm:
                     remaining.append("%s video (ffmpeg not installed)" % status)
+                elif need_fix and args.dry_run:
+                    actions.append("re-encode video to <=8 Mbps"
+                                   if args.reencode else
+                                   "remux %s video" % status)
                 elif need_fix:
                     src = os.path.join(tmpdir, "in.mp4")
                     with z.open(mp4) as s, open(src, "wb") as o:
@@ -333,10 +340,9 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                     else:
                         remaining.append("video fix failed (%s)" % status)
                     os.remove(src)
-                if not (args.reencode and new_mp4):
-                    if br and br > SPEC["bitrate_mbps"][1] + 0.05:
-                        remaining.append("bitrate %.1f Mbps > 8 (use --reencode)"
-                                         % br)
+                # only flag bitrate if a re-encode won't be fixing it
+                if not will_fix_video and br and br > SPEC["bitrate_mbps"][1] + 0.05:
+                    remaining.append("bitrate %.1f Mbps > 8 (use re-encode)" % br)
                 if dur is not None and not (SPEC["clip_seconds"][0] <= dur
                                             <= SPEC["clip_seconds"][1]):
                     remaining.append("clip length %.0f s out of 120-3600" % dur)
@@ -350,7 +356,10 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                 if g is not None:
                     ratio = g / 9.81
                     gross = ratio >= 1.5 or ratio <= 0.67   # clear FSR fault
-                    if gross:
+                    if gross and args.dry_run:
+                        actions.append("correct accel scale (gravity %.1f->9.8)"
+                                       % g)
+                    elif gross:
                         # Rescale by the measured factor so at-rest |accel|
                         # reads gravity. (The fault is ~2x/0.5x but not exactly
                         # a power of two, so use the measured factor, not a
@@ -509,12 +518,16 @@ def build_parser():
                         "environments (overrides --environment).")
     p.add_argument("--country", metavar="CC", help="Set location.country.")
     p.add_argument("--session-id", metavar="ID", help="Set session_id.")
-    p.add_argument("--reencode", action="store_true",
-                   help="Transcode video to <=8 Mbps H.264 (fixes bitrate; "
-                        "needs ffmpeg). Without it, over-bitrate files are "
-                        "flagged but left as-is.")
+    enc = p.add_mutually_exclusive_group()
+    enc.add_argument("--reencode", dest="reencode", action="store_true",
+                     default=True,
+                     help="(default) Transcode video to <=8 Mbps H.264 to fix "
+                          "the bitrate. Needs ffmpeg.")
+    enc.add_argument("--no-reencode", dest="reencode", action="store_false",
+                     help="Skip transcoding; leave the video as recorded "
+                          "(over-bitrate files are then flagged, not fixed).")
     p.add_argument("--reencode-mbps", type=float, default=7.0, metavar="N",
-                   help="Target bitrate for --reencode (default 7, cap 8).")
+                   help="Target bitrate for the re-encode (default 7, cap 8).")
     p.add_argument("--no-fix-imu", action="store_true",
                    help="Do not correct off-scale accelerometer data.")
     p.add_argument("--out", metavar="DIR",
@@ -558,8 +571,12 @@ def main(argv=None):
     if args.map:
         args.environment = None                # a CSV overrides the default
     if args.reencode and not have("ffmpeg"):
-        print("error: --reencode needs ffmpeg on PATH.")
-        return 2
+        # Re-encode is on by default; if ffmpeg is missing, don't fail the whole
+        # run -- do the metadata/IMU/remux fixes and flag bitrate instead.
+        print("note: ffmpeg not found -- skipping the bitrate re-encode; "
+              "over-bitrate files will be flagged. Install ffmpeg (or pass "
+              "--no-reencode) to silence this.\n")
+        args.reencode = False
     env_map = load_env_map(args.map) if args.map else None
 
     zips = find_zips(args.path, args.recursive)
