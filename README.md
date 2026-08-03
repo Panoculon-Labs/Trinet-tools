@@ -237,7 +237,7 @@ programs that require per-video metadata and enforce quality thresholds.
 ```bash
 # Windows: card in E:, ZIPs into D:\deliveries
 python scripts\ingest_sd_card.py --drive E: --collector alice01 ^
-    --country US --capture-date 2026-07-20 ^
+    --country US --environment residential/laundry --capture-date 2026-07-20 ^
     --calibration cal\unit-aa3d26ba.json --out D:\deliveries
 ```
 
@@ -250,19 +250,24 @@ alice01_20260720_aa3d26ba_recording3_1.zip
 
 It finds the card by itself (mounting it read-only if the system has not), and
 handles solo recordings and synced multi-camera takes alike. `metadata.json`
-covers the full collection spec: the details you pass on the command line, the
-device id, the video's technical properties (codec, resolution, frame rate,
-bitrate, GOP, B-frames and colour depth — the last three read straight from the
-H.264 bitstream), and the IMU metadata; `--calibration` folds in the intrinsics
-and extrinsics, with a properly computed fisheye field of view.
+covers the full collection spec: the details you pass on the command line
+(environment, country, collector/session), the device id, the video's technical
+properties (codec, resolution, frame rate, bitrate, GOP, B-frames and colour
+depth — the last three read straight from the H.264 bitstream), and the IMU
+metadata; `--calibration` folds in the intrinsics and extrinsics, with a
+properly computed fisheye field of view.
 
-Add `--mcap` to also emit a Foxglove-ready [MCAP](https://mcap.dev) per clip —
-IMU on an `/imu` topic and video as `foxglove.CompressedVideo` on a `/camera`
-topic, on one shared timeline, with the metadata and calibration embedded.
+More flags for delivery prep: `--mcap` emits a Foxglove-ready
+[MCAP](https://mcap.dev) per clip (IMU + video on one timeline); `--reencode`
+transcodes to a compliant ≤8 Mbps H.264 (via ffmpeg, hardware-accelerated when
+available); `--gate` skips clips that would be refused (too short, no IMU,
+truncated video). A companion `scripts/backfill_metadata.py` adds missing
+metadata fields to already-delivered ZIPs in place.
 
-**The recordings themselves are never altered** — they are copied into the ZIP
-byte for byte. **Standard-library Python 3 only**, no `pip install` and no
-`ffmpeg`, MCAP included.
+**The card is only ever read from**, and by default the MP4 index is rebuilt
+(lossless) so strict uploaders accept the file (`--no-repair` to copy verbatim).
+**Standard-library Python 3 only** — the sole exception is `--reencode`, which
+needs `ffmpeg`.
 
 Full guide, including the metadata field mapping, batch-vs-device calibration,
 MCAP output and how the card is found and mounted:

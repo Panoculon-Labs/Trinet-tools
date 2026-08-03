@@ -4,16 +4,20 @@
 ZIPs — one per clip — each carrying the video, the inertial sidecars, and a
 `metadata.json` describing where and how the footage was collected.
 
-It is aimed at data-collection programs that require per-video metadata. The
-script does one job: attach the metadata and zip. It does not inspect, grade or
-filter the footage.
+It is aimed at data-collection programs that require per-video metadata, with
+optional re-encoding to a target bitrate and quality gating for clips that would
+be refused downstream.
 
-**Standard-library Python 3 only.** No `pip install`, no `ffmpeg`. Runs the
-same on Windows, macOS and Linux.
+**Standard-library Python 3 only** for the core path — no `pip install`. Runs
+the same on Windows, macOS and Linux. The one exception is `--reencode`, which
+shells out to `ffmpeg` (the script checks for it and errors clearly if absent).
 
-**The recordings are never altered.** They go into the ZIP as byte-for-byte
-copies of what is on the card, and the card itself is only ever read from. The
-only flag that changes that is `--repair`, which is off unless you ask for it.
+**The card is only ever read from.** By default the packager rebuilds each
+MP4's index on a staged copy (`--repair`, on by default) so strict players and
+uploaders accept the file — lossless, no re-encode; pass `--no-repair` to copy
+the video byte-for-byte instead. `--reencode` transcodes the video (that is its
+purpose). Either way the `.imu`/`.vts` sidecars are copied unchanged and the SD
+card is never modified.
 
 ## Quickstart
 
@@ -80,6 +84,9 @@ IMU metadata.
   "clip_id": "grp10580_329b911e_1",
   "collector_id": "alice01",
   "session_id": "alice01-20260722-329b911e-s10580",
+  "environment_type": "residential",
+  "environment_subcategory": "laundry",
+  "environment": { "type": "residential", "subcategory": "laundry" },
   "location": { "country": "IN", "region": "Bhopal" },
   "capture": { "date": "2026-07-22" },
   "camera": {
@@ -127,6 +134,7 @@ IMU metadata.
 
 | Spec row | metadata.json |
 |---|---|
+| Environment Type | `environment_type` + `environment_subcategory` (+ nested `environment`) |
 | Geographic Location | `location.country` (+ optional `region`) |
 | User ID / Session ID | `collector_id` / `session_id` |
 | Camera Resolution / Frame Rate | `video.resolution_mp` / `video.nominal_fps` |
@@ -161,6 +169,19 @@ add their own keys; keys you did not supply are simply absent.
 |---|---|
 | `--collector ID` | Unique identifier for the person collecting. Also seeds the per-session id. |
 | `--country CC` | Geographic location (country). |
+| `--environment TYPE/SUB` | Environment type and sub-category (below). Required by the delivery spec. |
+
+### Environment values
+
+`--environment` takes `type/sub-category`. The categories below come from the
+collection spec; **they are not enforced** — any value packages, but one outside
+the list warns so a typo is caught. Spaces/dashes in the sub-category normalise
+to underscores.
+
+| Type | Sub-categories |
+|---|---|
+| `residential` | `laundry`, `kitchen_tidy`, `organize_room`, `other_household` |
+| `commercial` | `agriculture_landscaping_grounds`, `hospitality_housekeeping`, `automotive_service_maintenance`, `food_service_back_of_house`, `field_services_light_installation`, `commercial_cleaning_janitorial`, `retail_stocking_back_of_house`, `construction_skilled_trades`, `other` |
 
 ## Camera geometry
 
@@ -357,25 +378,77 @@ Anything else on the card that is not part of a recording is ignored: a clip is
 recognised by its `.mp4`, and only sidecars sharing that exact base name travel
 with it.
 
-## Clips that look ~1 second long
+## Index repair (default on)
 
 Some recordings read as only ~1 second in strict players and uploaders even
-though the footage is complete, because of the layout the camera writes them
-in. If the recipient's pipeline trips over this, `--repair` rebuilds each MP4's
-index on a staged copy before zipping:
+though the footage is complete, because of the fragmented layout the camera
+writes them in. To prevent that, the packager **rebuilds each MP4's index on a
+staged copy by default** — lossless, no re-encode, only the index changes. The
+SD card is never modified. Pass `--no-repair` to copy the video byte-for-byte
+instead (only do this if the recipient handles fragmented MP4).
+
+`metadata.json → tooling` records which path was taken. To repair files in
+place outside the packager, use
+[`scripts/repair_recordings.py`](../scripts/repair_recordings.py) directly.
+
+## Re-encoding to a target bitrate
+
+If the camera recorded above the delivery bitrate (Trinet units record ~10–11
+Mbps against a 6–8 Mbps spec), `--reencode` transcodes each clip to a compliant
+H.264 — GOP 30, no B-frames, 8-bit, capped at 8 Mbps:
 
 ```bash
---repair
+--reencode                 # target 7 Mbps (inside the 6-8 band)
+--reencode --reencode-mbps 7.5
 ```
 
-It is lossless — the video and audio are untouched and nothing is re-encoded,
-only the index is rebuilt — but **the bytes in the ZIP then differ from the
-bytes on the card**, so it is off by default and `metadata.json → tooling`
-records which of the two you used. The card is not modified either way.
+It runs as fast as the machine allows: a hardware encoder (NVENC on NVIDIA,
+VideoToolbox on macOS) when one actually works, otherwise `libx264 -preset
+veryfast`. Each candidate is smoke-tested first, so a compiled-but-unusable
+encoder (e.g. NVENC with no GPU) falls back to CPU cleanly. `-c:a copy` keeps
+any audio; `+faststart` makes the result openable everywhere. The `.imu`/`.vts`
+sidecars are untouched — frame count, order and timing are preserved, so
+alignment holds — and `metadata.json → video` reflects the re-encoded file.
 
-To repair files in place separately, or to recover a clip truncated by power
-loss mid-recording, use
-[`scripts/repair_recordings.py`](../scripts/repair_recordings.py) directly.
+**Needs `ffmpeg` on PATH.** Run several clips at once with `--jobs N`. A useful
+side effect: re-encoding also salvages some truncated/broken clips that a
+byte-copy would ship unreadable, because `ffmpeg` decodes what it can.
+
+## Quality gating
+
+By default every clip is packaged. To hold back clips that would be refused
+downstream, gate on them — they are skipped and listed in
+`rejected_<collector>_<date>.json` instead of being packaged:
+
+```bash
+--gate                     # = --min-duration 60 --require-imu --require-valid-video
+--min-duration 120         # skip clips shorter than N seconds (spec floor 120)
+--require-imu              # skip clips with no usable accel+gyro
+--require-valid-video     # skip truncated / unreadable MP4s
+```
+
+`--require-valid-video` uses the same box audit the delivery ingest does (the
+last box must end at EOF), so a clip cut mid-write is caught before it ships.
+
+## Backfilling a batch that already shipped
+
+If a batch went out missing a required field (e.g. `environment_type` was not
+recorded), `scripts/backfill_metadata.py` rewrites `metadata.json` inside the
+delivered ZIPs in place — no re-collection, no re-upload of the video:
+
+```bash
+# one environment for the whole batch
+python3 scripts/backfill_metadata.py DELIVERIES/ --environment residential/laundry
+
+# per-file, from a CSV of  zip_name-or-clip,environment
+python3 scripts/backfill_metadata.py DELIVERIES/ --map env_by_clip.csv
+
+# preview first
+python3 scripts/backfill_metadata.py DELIVERIES/ --environment residential/laundry --dry-run
+```
+
+It copies every other ZIP entry through untouched, is idempotent, and can also
+set `--country` / `--session-id`. Stdlib only.
 
 ## Full option list
 
@@ -393,7 +466,7 @@ custom folder name, add `--folder NAME`.
 drive. The script looks for a folder containing `.mp4` files, either at the
 card root or one level below it.
 
-**Codec, bitrate or field of view not what the program expects** — all three
-are camera configuration or hardware, not packaging. This script will not
-re-encode or alter footage to compensate; fix them at the camera before
-collecting a batch.
+**Bitrate over spec** — best fixed at the camera, but `--reencode` transcodes
+each clip down to a compliant ≤8 Mbps H.264 at ingest (see above) if you can't
+re-record. **Codec or field of view wrong** — those are camera/lens, not
+packaging; fix them at the camera before collecting a batch.

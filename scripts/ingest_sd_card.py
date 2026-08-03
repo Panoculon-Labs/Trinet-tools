@@ -30,6 +30,7 @@ all (unless you explicitly ask for --repair).
 
 import argparse
 import base64
+import concurrent.futures
 import datetime as _dt
 import json
 import math
@@ -48,6 +49,20 @@ try:
 except Exception:                                    # pragma: no cover
     _flatten_file = None
 
+
+# Environment taxonomy from the collection spec. type -> known sub-categories.
+# Not enforced: any value is accepted, but one outside this list warns.
+ENVIRONMENTS = {
+    "residential": [
+        "laundry", "kitchen_tidy", "organize_room", "other_household",
+    ],
+    "commercial": [
+        "agriculture_landscaping_grounds", "hospitality_housekeeping",
+        "automotive_service_maintenance", "food_service_back_of_house",
+        "field_services_light_installation", "commercial_cleaning_janitorial",
+        "retail_stocking_back_of_house", "construction_skilled_trades", "other",
+    ],
+}
 
 METADATA_SCHEMA = "trinet-delivery-metadata/2"
 
@@ -377,6 +392,144 @@ def _safe_size(path):
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+def container_status(path):
+    """Cheap MP4 integrity check, matching the delivery ingest's box audit.
+
+    Returns (status, detail): "ok", "truncated" (a box runs past EOF -- the
+    recording was cut mid-write), "no_video" (no moov/moof), "empty", or
+    "broken". Follows declared box sizes so an over-long final box is caught.
+    """
+    size = _safe_size(path)
+    if size < 16:
+        return "empty", "file is %d bytes" % size
+    try:
+        with open(path, "rb") as f:
+            o = 0
+            last_end = 0
+            saw_moov = saw_moof = False
+            while o + 8 <= size:
+                f.seek(o)
+                head = f.read(16)
+                if len(head) < 8:
+                    break
+                sz = _be32(head, 0)
+                hdr = 8
+                if sz == 1:
+                    if len(head) < 16:
+                        break
+                    sz = _be64(head, 8)
+                    hdr = 16
+                elif sz == 0:
+                    sz = size - o
+                if sz < hdr:
+                    return "broken", "bad box size %d at offset %d" % (sz, o)
+                typ = head[4:8]
+                if typ == b"moov":
+                    saw_moov = True
+                elif typ == b"moof":
+                    saw_moof = True
+                last_end = o + sz
+                o += sz
+    except OSError as e:
+        return "broken", str(e)
+    if last_end != size:
+        return "truncated", ("last box ends at %d of %d bytes"
+                             % (last_end, size))
+    if not (saw_moov or saw_moof):
+        return "no_video", "no moov/moof box"
+    return "ok", None
+
+
+# -- ffmpeg re-encode ----------------------------------------------------------
+def ffmpeg_path():
+    return shutil.which("ffmpeg")
+
+
+# Candidate H.264 encoders, fastest first. Each is verified to actually work on
+# this machine before use (compiled-in != usable -- e.g. NVENC with no GPU).
+_H264_ENCODERS = [
+    ("h264_nvenc", ["-preset", "p1", "-g", "30", "-bf", "0"]),
+    ("h264_videotoolbox", ["-g", "30", "-bf", "0"]),   # macOS hardware
+    ("libx264", ["-preset", "veryfast", "-g", "30", "-bf", "0", "-threads", "0"]),
+]
+_ENCODER_CACHE = {}
+
+
+def _encoder_works(ff, name):
+    """One-frame smoke test so a compiled-but-unusable encoder is skipped."""
+    try:
+        r = subprocess.run(
+            [ff, "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+             "-c:v", name, "-frames:v", "1", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _pick_h264_encoder():
+    """Pick the fastest H.264 encoder that actually runs here. Cached.
+    Returns (encoder_name, extra_args) with GOP 30 / no B-frames."""
+    if "enc" in _ENCODER_CACHE:
+        return _ENCODER_CACHE["enc"]
+    ff = ffmpeg_path()
+    chosen = _H264_ENCODERS[-1]                          # libx264 fallback
+    if ff:
+        for name, extra in _H264_ENCODERS:
+            if name == "libx264" or _encoder_works(ff, name):
+                chosen = (name, extra)
+                break
+    _ENCODER_CACHE["enc"] = chosen
+    return chosen
+
+
+def reencode_video(src, dst, target_mbps, log):
+    """Transcode src -> dst as spec-compliant H.264 <=8 Mbps. Returns bool.
+    Falls back to libx264 if the chosen (hardware) encoder fails at runtime."""
+    ff = ffmpeg_path()
+    if not ff:
+        return False
+    target = max(1.0, min(float(target_mbps), 8.0))     # keep inside 6-8 spec
+    enc, extra = _pick_h264_encoder()
+
+    def attempt(encoder, encoder_extra):
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
+               "-fflags", "+genpts+discardcorrupt", "-i", src,
+               "-map", "0:v:0", "-c:v", encoder,
+               "-b:v", "%dk" % int(target * 1000),
+               "-maxrate", "8000k", "-bufsize", "8000k"]
+        cmd += encoder_extra
+        cmd += ["-pix_fmt", "yuv420p",                   # 8-bit, no HDR
+                "-map", "0:a?", "-c:a", "copy",          # keep audio if any
+                "-movflags", "+faststart", dst]
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=3600)
+        except Exception as e:                           # pragma: no cover
+            return False, str(e)
+        if r.returncode != 0 or not os.path.isfile(dst) or _safe_size(dst) == 0:
+            tail = (r.stderr.decode("utf-8", "replace").strip().splitlines()
+                    or [""])[-1] if r.stderr else ""
+            return False, tail
+        return True, None
+
+    ok, err = attempt(enc, extra)
+    if ok:
+        return True
+    if enc != "libx264":                                 # hardware failed -> CPU
+        log.warn("%s: %s failed (%s); retrying with libx264"
+                 % (os.path.basename(src), enc, err))
+        _ENCODER_CACHE["enc"] = _H264_ENCODERS[-1]       # stop trying hardware
+        lib, lib_extra = _H264_ENCODERS[-1]
+        ok, err = attempt(lib, lib_extra)
+        if ok:
+            return True
+    log.warn("ffmpeg could not re-encode %s%s"
+             % (os.path.basename(src), ": " + err if err else ""))
+    return False
 
 
 def mp4_duration(path):
@@ -940,12 +1093,20 @@ class Clip:
         self.imu = None
         self.vts = None
         self.video = {}
+        self.container = ("ok", None)
         self.meta_sidecar = {}
         self.device_id_conflict = None
 
     # -- parsing ----------------------------------------------------------- #
     def parse(self, log):
         self.video = probe_video(self.mp4s)
+        # Container integrity: worst status across the clip's part(s).
+        self.container = ("ok", None)
+        for p in self.mp4s:
+            st, detail = container_status(p)
+            if st != "ok":
+                self.container = (st, detail)
+                break
 
         for path in self.sidecars.get("imu", []):
             got = read_imu(path)
@@ -1330,6 +1491,14 @@ def build_metadata(clip, args, calib, head):
         "clip_id": clip.base,
         "collector_id": args.collector,          # spec: User ID
         "session_id": session_id,                # spec: Session ID
+        # spec: Environment Type. Flat environment_type/subcategory are the
+        # fields the delivery ingest checks for; the nested object mirrors them.
+        "environment_type": args.env_type,
+        "environment_subcategory": args.env_subcategory,
+        "environment": {
+            "type": args.env_type,
+            "subcategory": args.env_subcategory,
+        },
         "location": {"country": args.country},   # spec: Geographic Location
         "capture": {"date": args.capture_date},
         "camera": {
@@ -1342,6 +1511,8 @@ def build_metadata(clip, args, calib, head):
         "duration_s": _round(clip.duration_s, 3),  # spec: Clip Length
     }
 
+    if args.env_note:
+        meta["environment"]["note"] = args.env_note
     if args.region:
         meta["location"]["region"] = args.region
     if args.participant_id:
@@ -1682,19 +1853,77 @@ def stage_and_repair(clip, staging, log):
         except Exception as e:                        # pragma: no cover
             log.warn("%s: index repair failed (%s)" % (os.path.basename(src), e))
             continue
-        if getattr(result, "name", str(result)) == "OK":
+        # RepairResult.OK == "repaired"; ALREADY_FLAT/SKIP/ERROR mean no rewrite.
+        if result == "repaired":
             rebuilt += 1
             log.info("    rebuilt MP4 index: %s" % os.path.basename(src))
     return staged, rebuilt
 
 
+def stage_and_reencode(clip, staging, args, log):
+    """Copy sidecars to staging and re-encode each MP4 to spec there.
+
+    The re-encoded MP4 is already a clean, faststart, spec-bitrate H.264, so
+    no separate index repair is needed. The .imu/.vts sidecars are copied
+    unchanged. The card is only read.
+    """
+    staged = []
+    for src in clip.all_files():
+        base = os.path.basename(src)
+        dst = os.path.join(staging, base)
+        if os.path.exists(dst):                           # part names collide
+            root, ext = os.path.splitext(base)
+            dst = os.path.join(staging, "%s_%d%s" % (root, len(staged), ext))
+        if src.lower().endswith(".mp4"):
+            if reencode_video(src, dst, args.reencode_mbps, log):
+                log.info("    re-encoded %s" % base)
+            else:
+                # Fall back to a verbatim copy so the clip still ships.
+                log.warn("%s: re-encode failed; copying original" % base)
+                shutil.copy2(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        staged.append((src, dst))
+    return staged
+
+
+def gate_reasons(clip, args):
+    """Reasons this clip should be skipped under the active gates, or []."""
+    reasons = []
+    min_dur = 60.0 if args.gate else args.min_duration
+    if min_dur:
+        d = clip.duration_s
+        if d is None:
+            reasons.append("duration unknown")
+        elif d < min_dur:
+            reasons.append("too short (%.1f s < %g s)" % (d, min_dur))
+    if args.gate or args.require_imu:
+        if not clip.imu or (clip.imu.get("samples") or 0) < 2:
+            reasons.append("no usable IMU")
+    if args.gate or args.require_valid_video:
+        st, detail = clip.container
+        if st != "ok":
+            reasons.append("%s video (%s)" % (st, detail))
+    return reasons
+
+
 def package(clip, args, calib, head, log):
-    """Build one ZIP. Returns (zip_path, metadata)."""
+    """Build one ZIP. Returns (zip_path, metadata, reject_reason)."""
     log.info("  %s" % clip.base)
     clip.parse(log)
 
     d = clip.duration_s
-    log.info("    %s" % ("%.1f s" % d if d else "duration unknown"))
+    cst = clip.container[0]
+    log.info("    %s%s"
+             % ("%.1f s" % d if d else "duration unknown",
+                "" if cst == "ok" else "  [%s]" % cst))
+
+    # Quality gates: skip clips that would be refused downstream.
+    rejects = gate_reasons(clip, args)
+    if rejects:
+        reason = "; ".join(rejects)
+        log.warn("%s: skipped -- %s" % (clip.base, reason))
+        return None, None, reason
 
     # Group-take base names already carry the device tag; don't repeat it.
     stem = [args.collector, args.capture_date.replace("-", "")]
@@ -1706,20 +1935,28 @@ def package(clip, args, calib, head, log):
     if os.path.exists(zip_path) and not args.overwrite:
         log.warn("%s already exists; skipping (--overwrite to replace)"
                  % zip_name)
-        return None, None
+        return None, None, None
 
     if args.dry_run:
-        log.info("    would write %s" % zip_name)
-        return None, None
+        log.info("    would write %s%s" % (zip_name,
+                 " (re-encoded)" if args.reencode else ""))
+        return None, None, None
 
-    # Default path: no staging at all -- the recordings are written into the
-    # ZIP straight from the card, byte for byte. Staging happens only when
-    # --repair asks for the MP4 indexes to be rebuilt.
-    staging = tempfile.mkdtemp(prefix="trinet_ingest_") if args.repair else None
+    # Staging is needed to rebuild indexes (--repair) or to re-encode; either
+    # way the card is only ever read. Without them, files go in verbatim.
+    need_staging = args.repair or args.reencode
+    staging = tempfile.mkdtemp(prefix="trinet_ingest_") if need_staging else None
     mcap_path = None
     try:
         rebuilt = 0
-        if staging:
+        if args.reencode:
+            sources = stage_and_reencode(clip, staging, args, log)
+            # Re-probe the re-encoded video so metadata reflects it.
+            new_mp4s = [dst for src, dst in sources
+                        if dst.lower().endswith(".mp4")]
+            if new_mp4s:
+                clip.video = probe_video(new_mp4s)
+        elif staging:
             sources, rebuilt = stage_and_repair(clip, staging, log)
         else:
             sources = [(p, p) for p in clip.all_files()]
@@ -1766,12 +2003,27 @@ def package(clip, args, calib, head, log):
 
     log.info("    -> %s (%.1f MB)"
              % (zip_name, os.path.getsize(zip_path) / 1e6))
-    return zip_path, meta
+    return zip_path, meta, None
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def parse_environment(value):
+    """Split TYPE/SUBCATEGORY. Any values are accepted; the known collection
+    taxonomy is only used to warn (in main), never to reject."""
+    if "/" not in value:
+        raise argparse.ArgumentTypeError(
+            "use TYPE/SUBCATEGORY, e.g. residential/laundry")
+    etype, sub = value.split("/", 1)
+    etype = etype.strip().lower()
+    sub = sub.strip().lower().replace(" ", "_").replace("-", "_")
+    if not etype or not sub:
+        raise argparse.ArgumentTypeError(
+            "both TYPE and SUBCATEGORY are required, e.g. residential/laundry")
+    return etype, sub
+
+
 def parse_date(value):
     try:
         return _dt.date.fromisoformat(value).isoformat()
@@ -1788,16 +2040,21 @@ def build_parser():
         epilog="""examples:
   # Windows, card in E:, one ZIP per clip into D:\\deliveries
   python scripts\\ingest_sd_card.py --drive E: --collector alice01 \\
-      --country US --calibration cal\\unit-aa3d26ba.json --out D:\\deliveries
+      --country US --environment residential/laundry \\
+      --calibration cal\\unit-aa3d26ba.json --out D:\\deliveries
 
-  # Auto-detect the card, add a task description
+  # Re-encode to spec bitrate and only keep deliverable clips
   python scripts/ingest_sd_card.py --collector bob02 --country GB \\
-      --task "strip and remake guest room" --out ./deliveries
+      --environment commercial/hospitality_housekeeping \\
+      --reencode --gate --out ./deliveries
 
   # See what would happen without writing anything
   python scripts/ingest_sd_card.py --drive E: --collector alice01 \\
-      --country US --dry-run
-""",
+      --country US --environment residential/laundry --dry-run
+
+known environment values (others are accepted with a warning):
+""" + "\n".join("  %-12s %s" % (t, ", ".join(s))
+                for t, s in ENVIRONMENTS.items()),
     )
 
     src = p.add_argument_group("source")
@@ -1813,6 +2070,12 @@ def build_parser():
                      help="Unique identifier for the person collecting.")
     req.add_argument("--country", required=True, metavar="CC",
                      help="Geographic location, country (e.g. US, GB, IN).")
+    req.add_argument("--environment", required=True, type=parse_environment,
+                     metavar="TYPE/SUB",
+                     help="Environment type and sub-category, e.g. "
+                          "residential/laundry. Required by the delivery spec. "
+                          "Any value is accepted; one outside the known list "
+                          "below warns but still packages.")
 
     opt = p.add_argument_group("optional metadata")
     opt.add_argument("--region", metavar="NAME",
@@ -1821,6 +2084,9 @@ def build_parser():
                      help='High-level task description, e.g. "dishes cleanup".')
     opt.add_argument("--task-labels", metavar="A,B,C",
                      help="Comma-separated low-level action labels.")
+    opt.add_argument("--env-note", metavar="TEXT",
+                     help="Free-text note about the environment (recommended "
+                          "when the sub-category is 'other').")
     opt.add_argument("--participant-id", metavar="ID",
                      help="Participant identifier, if distinct from the "
                           "collector.")
@@ -1870,12 +2136,43 @@ def build_parser():
                           "/camera topic, and the metadata + calibration "
                           "embedded. Opens directly in Foxglove. Adds the "
                           "video a second time, so the ZIP roughly doubles.")
-    out.add_argument("--repair", action="store_true",
-                     help="Rebuild each MP4's index on a staged copy before "
-                          "zipping, for uploaders that mis-read the recorded "
-                          "layout as ~1 second. Lossless -- no re-encode -- "
-                          "but the bytes then differ from the card. Off by "
-                          "default: recordings are copied verbatim.")
+    out.add_argument("--no-repair", dest="repair", action="store_false",
+                     help="Do NOT rebuild each MP4's index. By default the "
+                          "index is rebuilt on a staged copy (lossless, no "
+                          "re-encode) so strict players and uploaders accept "
+                          "the file; the card is never modified. Use this to "
+                          "copy the recordings verbatim instead.")
+
+    enc = p.add_argument_group("re-encode (needs ffmpeg)")
+    enc.add_argument("--reencode", action="store_true",
+                     help="Transcode each video to spec (H.264, GOP 30, no "
+                          "B-frames, 8-bit, <=8 Mbps) as fast as the machine "
+                          "allows (hardware NVENC if available, else libx264 "
+                          "veryfast). The .imu/.vts sidecars are untouched. "
+                          "Requires ffmpeg on PATH.")
+    enc.add_argument("--reencode-mbps", type=float, default=7.0, metavar="N",
+                     help="Target video bitrate for --reencode (default 7; "
+                          "hard-capped at 8 to stay inside the 6-8 spec).")
+    enc.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                     help="Package this many clips in parallel. Useful with "
+                          "--reencode (default 1).")
+
+    gate = p.add_argument_group("quality gating (skip bad clips)")
+    gate.add_argument("--gate", action="store_true",
+                      help="Skip clips that would be refused: shorter than "
+                           "60 s, missing IMU, or an unreadable/truncated "
+                           "video. Shortcut for --min-duration 60 "
+                           "--require-imu --require-valid-video.")
+    gate.add_argument("--min-duration", type=float, default=None, metavar="SECS",
+                      help="Skip clips shorter than SECS (the spec floor is "
+                           "120).")
+    gate.add_argument("--require-imu", action="store_true",
+                      help="Skip clips with no usable IMU (accel+gyro, "
+                           ">=2 samples).")
+    gate.add_argument("--require-valid-video", action="store_true",
+                      help="Skip clips whose MP4 is truncated or has no "
+                           "readable video track.")
+
     out.add_argument("--no-automount", dest="automount",
                      action="store_false",
                      help="Do not attach an unmounted card. By default, if no "
@@ -1894,11 +2191,29 @@ def main(argv=None):
     log = Log(args.quiet)
     we_mounted = []                # volumes this run attached, to detach after
 
+    args.env_type, args.env_subcategory = args.environment
+    if args.env_type not in ENVIRONMENTS:
+        log.warn("environment type '%s' is outside the spec (expected one of: "
+                 "%s). Packaging it anyway."
+                 % (args.env_type, ", ".join(sorted(ENVIRONMENTS))))
+    elif args.env_subcategory not in ENVIRONMENTS[args.env_type]:
+        log.warn("'%s' is not a listed %s sub-category. Packaging it anyway."
+                 % (args.env_subcategory, args.env_type))
+
     if not args.capture_date:
         args.capture_date = _dt.date.today().isoformat()
         log.warn("no --capture-date given; using today (%s). The camera has "
                  "no real-time clock, so card timestamps cannot supply it."
                  % args.capture_date)
+
+    if args.reencode:
+        if not ffmpeg_path():
+            print("error: --reencode needs ffmpeg on PATH (not found). "
+                  "Install ffmpeg, or drop --reencode.")
+            return 2
+        enc, _ = _pick_h264_encoder()
+        log.info("Re-encoding to <=%g Mbps H.264 via %s"
+                 % (min(args.reencode_mbps, 8.0), enc))
 
     # -- locate the card --------------------------------------------------- #
     if args.drive:
@@ -1974,20 +2289,47 @@ def main(argv=None):
     if not args.dry_run:
         os.makedirs(args.out, exist_ok=True)
 
-    written, skipped = 0, 0
-    for clip in clips:
-        zpath, _meta = package(clip, args, calib, head, log)
+    written = skipped = 0
+    rejected = []                        # (clip_base, reason)
+
+    def run(clip):
+        return clip, package(clip, args, calib, head, log)
+
+    jobs = max(1, args.jobs)
+    if jobs > 1 and len(clips) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+            results = list(ex.map(run, clips))
+    else:
+        results = [run(c) for c in clips]
+
+    for clip, (zpath, _meta, reject) in results:
         if zpath:
             written += 1
         else:
             skipped += 1
+            if reject:
+                rejected.append((clip.base, reject))
+
+    if rejected and not args.dry_run:
+        rej_path = os.path.join(
+            args.out, "rejected_%s_%s.json"
+            % (args.collector, args.capture_date.replace("-", "")))
+        with open(rej_path, "w", encoding="utf-8") as f:
+            json.dump({"schema": "trinet-ingest-rejects/1",
+                       "collector_id": args.collector,
+                       "count": len(rejected),
+                       "rejected": [{"clip": c, "reason": r}
+                                    for c, r in rejected]}, f, indent=2)
+            f.write("\n")
+        log.info("Rejected %d clip(s); see %s"
+                 % (len(rejected), os.path.basename(rej_path)))
 
     for dev, mp in we_mounted:
         unmount(dev)
         log.info("Unmounted %s (%s)" % (dev, mp))
 
-    print("\n%d packaged, %d skipped, %d warning(s)"
-          % (written, skipped, len(log.warnings)))
+    print("\n%d packaged, %d skipped (%d gated out), %d warning(s)"
+          % (written, skipped, len(rejected), len(log.warnings)))
     return 0 if written else 1
 
 
