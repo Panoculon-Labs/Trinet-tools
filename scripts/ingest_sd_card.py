@@ -2031,6 +2031,17 @@ def gate_reasons(clip, args):
     return reasons
 
 
+def _scratch_dir(args):
+    """Where to stage/transcode video. Defaults to the output folder's
+    filesystem (not /tmp, which is often a small RAM disk)."""
+    d = getattr(args, "temp_dir", None) or args.out or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = tempfile.gettempdir()
+    return d
+
+
 def package(clip, args, calib, head, log):
     """Build one ZIP. Returns (zip_path, metadata, reject_reason)."""
     log.info("  %s" % clip.base)
@@ -2070,7 +2081,9 @@ def package(clip, args, calib, head, log):
     # an off-scale accelerometer; either way the card is only ever read.
     imu_factor = imu_scale_factor(clip, args)
     need_staging = args.repair or args.reencode or imu_factor is not None
-    staging = tempfile.mkdtemp(prefix="trinet_ingest_") if need_staging else None
+    scratch = _scratch_dir(args)
+    staging = (tempfile.mkdtemp(prefix=".trinet_ingest_", dir=scratch)
+               if need_staging else None)
     mcap_path = None
     try:
         rebuilt = 0
@@ -2096,7 +2109,7 @@ def package(clip, args, calib, head, log):
         mcap_path = None
         if args.mcap:
             mcap_path = os.path.join(staging or tempfile.mkdtemp(
-                prefix="trinet_mcap_"), clip.base + ".mcap")
+                prefix=".trinet_mcap_", dir=scratch), clip.base + ".mcap")
             try:
                 write_mcap(mcap_path, clip, meta, args.calibration, log)
             except Exception as e:                    # never fail the ZIP
@@ -2255,6 +2268,10 @@ known environment values (others are accepted with a warning):
     out = p.add_argument_group("output")
     out.add_argument("--out", "-o", default="deliveries", metavar="DIR",
                      help="Where to write the ZIPs (default: ./deliveries).")
+    out.add_argument("--temp-dir", metavar="DIR",
+                     help="Scratch space for staging/transcoding video. "
+                          "Defaults to the output folder (NOT /tmp, which is "
+                          "often a small RAM disk).")
     out.add_argument("--overwrite", action="store_true",
                      help="Replace ZIPs that already exist.")
     out.add_argument("--mcap", action="store_true",

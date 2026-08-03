@@ -495,11 +495,24 @@ def split_and_repair(z, names, info, meta, e, country, session, args, tag,
 # --------------------------------------------------------------------------- #
 # per-ZIP repair
 # --------------------------------------------------------------------------- #
+def _scratch_dir(out_path, args):
+    """Where to extract/transcode multi-GB video. Defaults to the output
+    folder's filesystem (not /tmp, which is often a small RAM disk)."""
+    d = getattr(args, "temp_dir", None) or os.path.dirname(
+        os.path.abspath(out_path)) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = tempfile.gettempdir()
+    return d
+
+
 def repair_zip(zp, out_path, env, env_map, country, session, args):
     name = os.path.basename(zp)
     actions, remaining = [], []
     t_start = time.monotonic()
-    tmpdir = tempfile.mkdtemp(prefix="trinet_repair_")
+    tmpdir = tempfile.mkdtemp(prefix=".trinet_repair_",
+                             dir=_scratch_dir(out_path, args))
     try:
         z = zipfile.ZipFile(zp)
         try:
@@ -817,6 +830,11 @@ def build_parser():
                         "flag them instead.")
     p.add_argument("--out", metavar="DIR",
                    help="Write repaired copies here instead of in place.")
+    p.add_argument("--temp-dir", metavar="DIR",
+                   help="Scratch space for extracting/transcoding video. "
+                        "Defaults to the output folder (NOT /tmp, which is "
+                        "often a small RAM disk). Point it at a disk with room "
+                        "for a few times the largest clip.")
     p.add_argument("--recursive", "-r", action="store_true")
     p.add_argument("--jobs", "-j", type=int, default=0, metavar="N",
                    help="Repair this many ZIPs in parallel. Default 0 = one "
