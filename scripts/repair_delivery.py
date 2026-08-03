@@ -45,7 +45,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+
+
+def _say(msg):
+    """Print one line, flushed, so live progress reaches the terminal even
+    from a worker process."""
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
 
 SPEC = {"clip_seconds": (120.0, 3600.0), "bitrate_mbps": (6.0, 8.0),
         "gravity_ms2": (9.0, 10.6)}
@@ -197,27 +205,41 @@ def ff_remux(src, dst):
     return r.returncode == 0 and os.path.getsize(dst) > 0
 
 
-def ff_reencode(src, dst, target_mbps, threads=0):
+def ff_reencode(src, dst, target_mbps, threads=0, duration=None, tag=""):
     t = max(1.0, min(float(target_mbps), 8.0))
     enc, extra = pick_encoder()
 
     def run(name, ex):
         if name == "libx264":                             # cap CPU threads/job
             ex = [str(threads) if a == "0" else a for a in ex]
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-               "-fflags", "+genpts+discardcorrupt", "-i", src,
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+               "-y", "-fflags", "+genpts+discardcorrupt", "-i", src,
                "-map", "0:v:0", "-c:v", name,
                "-b:v", "%dk" % int(t * 1000),
                "-maxrate", "8000k", "-bufsize", "8000k"] + ex + \
               ["-pix_fmt", "yuv420p", "-map", "0:a?", "-c:a", "copy",
-               "-movflags", "+faststart", dst]
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, timeout=14400).returncode
+               "-movflags", "+faststart", "-progress", "pipe:1", dst]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True,
+                                bufsize=1)
+        last = -100
+        for line in proc.stdout:                          # ffmpeg -progress
+            if line.startswith("out_time_us=") and duration:
+                us = line.strip().split("=", 1)[1]
+                if us.isdigit():
+                    pct = min(100.0, 100.0 * (int(us) / 1e6) / duration)
+                    if pct - last >= 20:                  # throttle
+                        last = pct
+                        _say("     %-30s re-encoding %3d%% (%s)"
+                             % (tag, int(pct), name.replace("h264_", "")))
+        proc.wait()
+        return proc.returncode
     if run(enc, extra) == 0 and os.path.getsize(dst) > 0:
         return True
     if enc != "libx264":                                  # hw failed -> cpu
         _ENC["e"] = _ENCODERS[-1]
         lib, lex = _ENCODERS[-1]
+        _say("     %-30s hardware encoder failed; retrying on CPU" % tag)
         return run(lib, lex) == 0 and os.path.getsize(dst) > 0
     return False
 
@@ -285,6 +307,7 @@ def rescale_accel(data, factor):
 def repair_zip(zp, out_path, env, env_map, country, session, args):
     name = os.path.basename(zp)
     actions, remaining = [], []
+    t_start = time.monotonic()
     tmpdir = tempfile.mkdtemp(prefix="trinet_repair_")
     try:
         z = zipfile.ZipFile(zp)
@@ -297,6 +320,9 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
             if "metadata.json" in names:
                 meta = json.loads(z.read("metadata.json").decode("utf-8"))
             clip_id = meta.get("clip_id", name)
+            tag = (clip_id or name)
+            tag = tag[:-4] if tag.lower().endswith(".zip") else tag
+            tag = tag[:30]
 
             e = env
             if env_map is not None:
@@ -306,13 +332,25 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                 if e is None:
                     remaining.append("no environment mapping")
 
+            # ---- analyse (cheap): container, bitrate, gravity ----
+            size = info[mp4].file_size if mp4 else 0
+            dur = meta.get("duration_s")
+            status = "no_mp4"
+            br = None
+            if mp4:
+                status, _d = container_status_zip(z, mp4, size)
+                br = (size * 8 / dur / 1e6) if dur else None
+            idata = z.read(imu) if (imu and not args.no_fix_imu) else None
+            g = imu_gravity_and_rate(idata)[0] if idata else None
+            if not args.dry_run:
+                _say("* %-30s %-8s | %-9s | %-11s | gravity %s"
+                     % (tag, ("%.0fs" % dur) if dur else "?s", status,
+                        ("%.1f Mbps" % br) if br else "bitrate ?",
+                        ("%.2f m/s^2" % g) if g is not None else "n/a"))
+
             # ---- video: only extract when ffmpeg has to touch it ----
             new_mp4 = None
             if mp4:
-                size = info[mp4].file_size
-                status, _d = container_status_zip(z, mp4, size)
-                dur = meta.get("duration_s")
-                br = (size * 8 / dur / 1e6) if dur else None
                 ffm = have("ffmpeg")
                 need_fix = args.reencode or (status not in ("ok", "no_video"))
                 will_fix_video = need_fix and status != "no_video" and ffm
@@ -326,72 +364,87 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                                    "remux %s video" % status)
                 elif need_fix:
                     src = os.path.join(tmpdir, "in.mp4")
+                    _say("     %-30s extracting video (%.1f GB)..."
+                         % (tag, size / 1e9))
                     with z.open(mp4) as s, open(src, "wb") as o:
                         shutil.copyfileobj(s, o, 1 << 20)
                     dst = os.path.join(tmpdir, "out.mp4")
                     if args.reencode and ff_reencode(
                             src, dst, args.reencode_mbps,
-                            getattr(args, "enc_threads", 0)):
+                            getattr(args, "enc_threads", 0),
+                            duration=dur, tag=tag):
                         new_mp4 = dst
                         actions.append("re-encoded video to <=8 Mbps")
-                    elif not args.reencode and ff_remux(src, dst):
-                        new_mp4 = dst
-                        actions.append("remuxed %s video" % status)
+                    elif not args.reencode:
+                        _say("     %-30s remuxing %s video..." % (tag, status))
+                        if ff_remux(src, dst):
+                            new_mp4 = dst
+                            actions.append("remuxed %s video" % status)
+                        else:
+                            remaining.append("video fix failed (%s)" % status)
                     else:
                         remaining.append("video fix failed (%s)" % status)
                     os.remove(src)
-                # only flag bitrate if a re-encode won't be fixing it
                 if not will_fix_video and br and br > SPEC["bitrate_mbps"][1] + 0.05:
                     remaining.append("bitrate %.1f Mbps > 8 (use re-encode)" % br)
                 if dur is not None and not (SPEC["clip_seconds"][0] <= dur
                                             <= SPEC["clip_seconds"][1]):
                     remaining.append("clip length %.0f s out of 120-3600" % dur)
 
-            # ---- imu accel scale ----
+            # ---- imu accel scale (reuse idata/g from analysis) ----
             new_imu = None
             imu_fix = None
-            if imu and not args.no_fix_imu:
-                idata = z.read(imu)
-                g, _nw, _rate, _ss = imu_gravity_and_rate(idata)
-                if g is not None:
-                    ratio = g / 9.81
-                    gross = ratio >= 1.5 or ratio <= 0.67   # clear FSR fault
-                    if gross and args.dry_run:
-                        actions.append("correct accel scale (gravity %.1f->9.8)"
-                                       % g)
-                    elif gross:
-                        # Rescale by the measured factor so at-rest |accel|
-                        # reads gravity. (The fault is ~2x/0.5x but not exactly
-                        # a power of two, so use the measured factor, not a
-                        # snapped one.) Gyro is a separate range and unaffected.
-                        fac = ratio
-                        new_imu = rescale_accel(idata, fac)
-                        g2 = imu_gravity_and_rate(new_imu)[0]
-                        imu_fix = {"before": round(g, 3), "factor": fac,
-                                   "after": round(g2, 3) if g2 else None}
-                        actions.append(
-                            "corrected accel scale x%.3f (gravity %.1f->%.1f)"
-                            % (1.0 / fac, g, g2 or 0))
-                    elif not (SPEC["gravity_ms2"][0] <= g
-                              <= SPEC["gravity_ms2"][1]):
-                        remaining.append(
-                            "gravity %.2f mildly off-spec -- review, not "
-                            "auto-corrected (could be motion, not scale)" % g)
+            if idata is not None and g is not None:
+                ratio = g / 9.81
+                gross = ratio >= 1.5 or ratio <= 0.67       # clear FSR fault
+                if gross and args.dry_run:
+                    actions.append("correct accel scale (gravity %.1f->9.8)" % g)
+                elif gross:
+                    # Rescale by the measured factor so at-rest |accel| reads
+                    # gravity. (The fault is ~2x/0.5x but not exactly a power of
+                    # two, so use the measured factor.) Gyro is a separate range
+                    # and unaffected.
+                    fac = ratio
+                    _say("     %-30s correcting accel scale (gravity %.1f)"
+                         % (tag, g))
+                    new_imu = rescale_accel(idata, fac)
+                    g2 = imu_gravity_and_rate(new_imu)[0]
+                    imu_fix = {"before": round(g, 3), "factor": fac,
+                               "after": round(g2, 3) if g2 else None}
+                    actions.append(
+                        "corrected accel scale x%.3f (gravity %.1f->%.1f)"
+                        % (1.0 / fac, g, g2 or 0))
+                elif not (SPEC["gravity_ms2"][0] <= g <= SPEC["gravity_ms2"][1]):
+                    remaining.append(
+                        "gravity %.2f mildly off-spec -- review, not "
+                        "auto-corrected (could be motion, not scale)" % g)
+
+            # ---- stale MCAP: it embeds its own copy of video+imu+metadata ----
+            mcap = next((n for n in names if n.lower().endswith(".mcap")), None)
+            drop_mcap = bool(mcap and (new_mp4 or new_imu))
+            if drop_mcap:
+                actions.append("removed stale .mcap (regenerate from sidecars "
+                               "if needed)")
 
             meta_changed = _patch_metadata(meta, e, country, session,
                                            new_mp4, imu_fix, actions)
 
             if args.dry_run:
                 return _result(name, actions, remaining, dry=True)
-            need_write = bool(new_mp4 or new_imu or meta_changed)
+            need_write = bool(new_mp4 or new_imu or meta_changed or drop_mcap)
             if not need_write:
+                _say("= %-30s already compliant (%.0fs)"
+                     % (tag, time.monotonic() - t_start))
                 return _result(name, actions or ["already compliant"],
                                remaining)
 
             # ---- rewrite: stream unchanged members, swap fixed ones ----
+            _say("     %-30s writing repaired ZIP..." % tag)
             tmp_zip = out_path + ".part"
             with zipfile.ZipFile(tmp_zip, "w", allowZip64=True) as zo:
                 for n in names:
+                    if n == mcap and drop_mcap:
+                        continue                         # stale; leave it out
                     if n == mp4 and new_mp4:
                         zo.write(new_mp4, mp4, compress_type=zipfile.ZIP_STORED)
                     elif n == mp4:                       # unchanged: stream copy
@@ -417,8 +470,14 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
         finally:
             z.close()
         os.replace(tmp_zip, out_path)
+        mark = "OK " if not remaining else "!! "
+        _say("%s %-30s %s%s (%.0fs)"
+             % (mark, tag, "; ".join(actions) or "no change",
+                ("  [needs: " + "; ".join(remaining) + "]") if remaining else "",
+                time.monotonic() - t_start))
         return _result(name, actions, remaining)
     except Exception as ex:                               # pragma: no cover
+        _say("!! %-30s ERROR: %s" % (tag if 'tag' in dir() else name, ex))
         return _result(name, actions, remaining + ["ERROR: %s" % ex],
                        error=True)
     finally:
@@ -613,7 +672,6 @@ def main(argv=None):
 
     fixed = clean = flagged = errs = 0
     for r in results:
-        tag = "FAIL" if r["error"] else ("flag" if r["remaining"] else "ok  ")
         if r["error"]:
             errs += 1
         elif r["actions"] and r["actions"] != ["already compliant"]:
@@ -622,11 +680,21 @@ def main(argv=None):
             clean += 1
         if r["remaining"]:
             flagged += 1
-        print("[%s] %s" % (tag, r["zip"]))
-        for a in r["actions"]:
-            print("        + %s" % a)
-        for rem in r["remaining"]:
-            print("        ! %s" % rem)
+        # Real runs already streamed each file live; only the dry-run plan and
+        # the leftover "needs" list are printed here.
+        if args.dry_run:
+            mark = "flag" if r["remaining"] else "ok  "
+            print("[%s] %s" % (mark, r["zip"]))
+            for a in r["actions"]:
+                print("        + %s" % a)
+            for rem in r["remaining"]:
+                print("        ! %s" % rem)
+
+    if not args.dry_run and flagged:
+        print("\nStill needs attention (could not be auto-fixed):")
+        for r in results:
+            for rem in r["remaining"]:
+                print("  %-40s %s" % (r["zip"][:40], rem))
 
     print("\n%d repaired, %d already-compliant, %d still-flagged, %d error(s)"
           % (fixed, clean, flagged, errs))
