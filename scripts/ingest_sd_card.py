@@ -658,6 +658,59 @@ def imu_gravity(paths, nominal_rate_hz=400):
     return med, len(still), still[0], still[-1]
 
 
+def imu_scale_factor(clip, args):
+    """The accel-scale correction factor for a grossly off-scale unit, or None.
+
+    Only a clear full-scale-range fault (at-rest gravity ~2x or ~0.5x of 9.81)
+    is corrected; borderline values are left alone. Returns g/9.81 (divide the
+    accel by this to bring gravity to 9.81)."""
+    if args.no_fix_imu:
+        return None
+    g = getattr(clip, "gravity", (None,))[0]
+    if g is None:
+        return None
+    ratio = g / 9.81
+    return ratio if (ratio >= 1.5 or ratio <= 0.67) else None
+
+
+def rescale_accel_file(path, factor):
+    """Divide every accel sample in a .imu file by `factor`, in place."""
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    if len(data) < IMU_HEADER or data[:8] != IMU_MAGIC:
+        return
+    ss = IMU_SAMPLE_SIZE.get(_u32(data, 8))
+    if not ss:
+        return
+    n = (len(data) - IMU_HEADER) // ss
+    inv = 1.0 / factor
+    acc = struct.Struct("<3f")
+    for i in range(n):
+        p = IMU_HEADER + i * ss + 8
+        ax, ay, az = acc.unpack_from(data, p)
+        acc.pack_into(data, p, ax * inv, ay * inv, az * inv)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def fix_imu_scale(clip, sources, factor, log):
+    """Rescale the staged .imu sidecar(s) and update the clip's gravity so the
+    metadata reflects the correction."""
+    for _src, dst in sources:
+        if dst.lower().endswith(".imu"):
+            rescale_accel_file(dst, factor)
+    staged_imus = [dst for _s, dst in sources if dst.lower().endswith(".imu")]
+    if not staged_imus:
+        return
+    rate = (clip.imu or {}).get("nominal_rate_hz") or 400
+    clip.gravity = imu_gravity(staged_imus, rate)
+    clip.imu_scale_fix = {"applied_factor": round(1.0 / factor, 4),
+                          "gravity_after_ms2": _round(clip.gravity[0], 3)}
+    log.info("    corrected accel scale x%.3f (gravity %.1f -> %.1f)"
+             % (1.0 / factor, factor * 9.81,
+                clip.gravity[0] if clip.gravity[0] else 0.0))
+
+
 def iter_vts_frames(path):
     """Yield sof_timestamp_ns for each frame entry (0 if unavailable)."""
     size = os.path.getsize(path)
@@ -1128,6 +1181,7 @@ class Clip:
         self.video = {}
         self.container = ("ok", None)
         self.gravity = (None, 0, None, None)
+        self.imu_scale_fix = None
         self.meta_sidecar = {}
         self.device_id_conflict = None
 
@@ -1663,6 +1717,14 @@ def _imu_metadata(clip):
                 "off nominal 9.81 by %.2fx -- likely an accelerometer "
                 "full-scale-range misconfiguration on this unit."
                 % (grav_med / 9.81))
+    fix = getattr(clip, "imu_scale_fix", None)
+    if fix:
+        accel["scale_corrected"] = {
+            "applied_factor": fix["applied_factor"],
+            "note": ("accelerometer was recorded at the wrong full-scale "
+                     "range; accel samples rescaled so at-rest gravity ~= "
+                     "9.81. Gyroscope unaffected."),
+        }
     return {
         "present": True,
         "data_files": imu_files,
@@ -1960,7 +2022,10 @@ def gate_reasons(clip, args):
             reasons.append("%s video (%s)" % (st, detail))
     if args.gate or args.require_imu_gravity:
         g = clip.gravity[0]
-        if g is not None and not (9.0 <= g <= 10.6):
+        # A gross fault that will be auto-corrected (imu_scale_factor) is not a
+        # reason to skip; only an uncorrectable (mild) off-scale gates the clip.
+        if (g is not None and not (9.0 <= g <= 10.6)
+                and imu_scale_factor(clip, args) is None):
             reasons.append("accel gravity off-scale (%.2f m/s^2, %.2fx nominal)"
                            % (g, g / 9.81))
     return reasons
@@ -2001,9 +2066,10 @@ def package(clip, args, calib, head, log):
                  " (re-encoded)" if args.reencode else ""))
         return None, None, None
 
-    # Staging is needed to rebuild indexes (--repair) or to re-encode; either
-    # way the card is only ever read. Without them, files go in verbatim.
-    need_staging = args.repair or args.reencode
+    # Staging is needed to rebuild indexes (--repair), re-encode, or correct
+    # an off-scale accelerometer; either way the card is only ever read.
+    imu_factor = imu_scale_factor(clip, args)
+    need_staging = args.repair or args.reencode or imu_factor is not None
     staging = tempfile.mkdtemp(prefix="trinet_ingest_") if need_staging else None
     mcap_path = None
     try:
@@ -2019,6 +2085,9 @@ def package(clip, args, calib, head, log):
             sources, rebuilt = stage_and_repair(clip, staging, log)
         else:
             sources = [(p, p) for p in clip.all_files()]
+
+        if imu_factor is not None:
+            fix_imu_scale(clip, sources, imu_factor, log)
 
         meta = build_metadata(clip, args, calib, head)
 
@@ -2202,19 +2271,28 @@ known environment values (others are accepted with a warning):
                           "the file; the card is never modified. Use this to "
                           "copy the recordings verbatim instead.")
 
-    enc = p.add_argument_group("re-encode (needs ffmpeg)")
-    enc.add_argument("--reencode", action="store_true",
-                     help="Transcode each video to spec (H.264, GOP 30, no "
-                          "B-frames, 8-bit, <=8 Mbps) as fast as the machine "
-                          "allows (hardware NVENC if available, else libx264 "
-                          "veryfast). The .imu/.vts sidecars are untouched. "
-                          "Requires ffmpeg on PATH.")
+    enc = p.add_argument_group("re-encode / IMU fix (needs ffmpeg for video)")
+    encx = enc.add_mutually_exclusive_group()
+    encx.add_argument("--reencode", dest="reencode", action="store_true",
+                      default=True,
+                      help="(default) Transcode each video to spec (H.264, "
+                           "GOP 30, no B-frames, 8-bit, <=8 Mbps) as fast as "
+                           "the machine allows (hardware NVENC if available, "
+                           "else libx264 veryfast). Needs ffmpeg; if it is "
+                           "missing, this is skipped with a note.")
+    encx.add_argument("--no-reencode", dest="reencode", action="store_false",
+                      help="Skip transcoding; leave the recorded bitrate as-is "
+                           "(the MP4 index is still rebuilt for playability).")
     enc.add_argument("--reencode-mbps", type=float, default=7.0, metavar="N",
-                     help="Target video bitrate for --reencode (default 7; "
+                     help="Target video bitrate for the re-encode (default 7; "
                           "hard-capped at 8 to stay inside the 6-8 spec).")
+    enc.add_argument("--no-fix-imu", action="store_true",
+                     help="Do not correct an off-scale accelerometer. By "
+                          "default, a clip whose at-rest gravity reads ~2x or "
+                          "~0.5x of 9.81 m/s^2 has its accel rescaled to the "
+                          "true range (gyro unaffected).")
     enc.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
-                     help="Package this many clips in parallel. Useful with "
-                          "--reencode (default 1).")
+                     help="Package this many clips in parallel (default 1).")
 
     gate = p.add_argument_group("quality gating (skip bad clips)")
     gate.add_argument("--gate", action="store_true",
@@ -2271,12 +2349,16 @@ def main(argv=None):
 
     if args.reencode:
         if not ffmpeg_path():
-            print("error: --reencode needs ffmpeg on PATH (not found). "
-                  "Install ffmpeg, or drop --reencode.")
-            return 2
-        enc, _ = _pick_h264_encoder()
-        log.info("Re-encoding to <=%g Mbps H.264 via %s"
-                 % (min(args.reencode_mbps, 8.0), enc))
+            # Re-encode is on by default; a missing ffmpeg downgrades to a note
+            # (the index is still rebuilt, bitrate is left as recorded).
+            log.warn("ffmpeg not found -- skipping the bitrate re-encode "
+                     "(video index is still rebuilt). Install ffmpeg or pass "
+                     "--no-reencode to silence this.")
+            args.reencode = False
+        else:
+            enc, _ = _pick_h264_encoder()
+            log.info("Re-encoding to <=%g Mbps H.264 via %s"
+                     % (min(args.reencode_mbps, 8.0), enc))
 
     # -- locate the card --------------------------------------------------- #
     if args.drive:

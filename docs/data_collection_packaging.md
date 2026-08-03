@@ -391,28 +391,32 @@ instead (only do this if the recipient handles fragmented MP4).
 place outside the packager, use
 [`scripts/repair_recordings.py`](../scripts/repair_recordings.py) directly.
 
-## Re-encoding to a target bitrate
+## Re-encoding to a target bitrate (default on)
 
-If the camera recorded above the delivery bitrate (Trinet units record ~10–11
-Mbps against a 6–8 Mbps spec), `--reencode` transcodes each clip to a compliant
-H.264 — GOP 30, no B-frames, 8-bit, capped at 8 Mbps:
-
-```bash
---reencode                 # target 7 Mbps (inside the 6-8 band)
---reencode --reencode-mbps 7.5
-```
+Trinet units record ~10–11 Mbps against a 6–8 Mbps spec, so the packager
+**re-encodes each clip to a compliant H.264 by default** — GOP 30, no B-frames,
+8-bit, capped at 8 Mbps (target 7). Pass `--no-reencode` to keep the recorded
+bitrate (the index is still rebuilt); `--reencode-mbps N` changes the target.
 
 It runs as fast as the machine allows: a hardware encoder (NVENC on NVIDIA,
 VideoToolbox on macOS) when one actually works, otherwise `libx264 -preset
 veryfast`. Each candidate is smoke-tested first, so a compiled-but-unusable
 encoder (e.g. NVENC with no GPU) falls back to CPU cleanly. `-c:a copy` keeps
 any audio; `+faststart` makes the result openable everywhere. The `.imu`/`.vts`
-sidecars are untouched — frame count, order and timing are preserved, so
-alignment holds — and `metadata.json → video` reflects the re-encoded file.
+sidecars keep their frame count, order and timing, so alignment holds, and
+`metadata.json → video` reflects the re-encoded file.
 
-**Needs `ffmpeg` on PATH.** Run several clips at once with `--jobs N`. A useful
-side effect: re-encoding also salvages some truncated/broken clips that a
-byte-copy would ship unreadable, because `ffmpeg` decodes what it can.
+**Needs `ffmpeg` on PATH** — if it is missing, the re-encode is skipped with a
+note (the index is still rebuilt). Run several clips at once with `--jobs N`.
+
+## Correcting an off-scale accelerometer (default on)
+
+If a unit recorded its accelerometer at the wrong full-scale range — its at-rest
+gravity reads ~2× or ~0.5× of 9.81 m/s² — the packager rescales the `.imu` accel
+samples to the true range so gravity reads ~9.81 (the gyroscope is a separate
+range and is left alone). Only gross faults are corrected; a borderline value is
+left as recorded. `metadata.json → imu.accelerometer.scale_corrected` records
+the factor applied. Pass `--no-fix-imu` to disable.
 
 ## Quality gating
 
