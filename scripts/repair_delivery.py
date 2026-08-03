@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Repair delivered Trinet ZIPs to match the delivery spec -- in place.
 
-Self-contained: one file, Python 3 only (plus ffmpeg for the video fixes).
-Send it to whoever holds the ZIPs; they run it over their delivery folder.
+Python 3 only, plus ffmpeg for the video fixes. Ships as two files kept in the
+same folder: this one and repair_recordings.py (used to rebuild a fragmented
+MP4's index so ffmpeg can read it). Send both to whoever holds the ZIPs; they
+run this over their delivery folder.
 
 For each ZIP it will, as needed:
   * add the required environment_type / sub-category to metadata.json
-  * remux a truncated / broken MP4 into a clean, playable file (lossless)
-  * with --reencode, transcode video to the spec bitrate (<=8 Mbps H.264,
-    GOP 30, no B-frames, 8-bit) -- fast, uses the GPU when available
+  * rebuild a fragmented / broken MP4 index and remux it into a clean file
+  * split a clip longer than 1 hour into ~30-min chunks, each its own ZIP with
+    a time-synced IMU/VTS slice (so each stays within the 120-3600 s spec)
+  * re-encode video to the spec bitrate (<=8 Mbps H.264, GOP 30, no B-frames,
+    8-bit) by default -- fast, uses the GPU when available (--no-reencode skips)
   * correct an accelerometer that was recorded at the wrong scale (its at-rest
     gravity reads ~2x or ~0.5x of 9.81 m/s^2) by rescaling to the true range
   * refresh the video / IMU numbers in metadata.json to match the repaired files
@@ -47,6 +51,15 @@ import sys
 import tempfile
 import time
 import zipfile
+
+# flatten_file rebuilds a fragmented MP4's moov so ffmpeg (and strict players)
+# can read it. Shipped alongside as repair_recordings.py; ffmpeg cannot repair
+# these itself because it cannot even open them ("trun track id unknown").
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from repair_recordings import flatten_file as _flatten_file
+except Exception:                                        # pragma: no cover
+    _flatten_file = None
 
 
 def _say(msg):
@@ -125,34 +138,26 @@ def _walk_boxes(f, size):
         last_end = o + sz
         o += sz
     if last_end != size:
-        return "truncated", "last box ends at %d of %d" % (last_end, size)
+        return "truncated", "last box ends at %d of %d" % (last_end, size), saw
     if not (b"moov" in saw or b"moof" in saw):
-        return "no_video", "no moov/moof"
-    return "ok", None
-
-
-def container_status(path):
-    size = os.path.getsize(path)
-    if size < 16:
-        return "empty", "%d bytes" % size
-    try:
-        with open(path, "rb") as f:
-            return _walk_boxes(f, size)
-    except OSError as e:
-        return "broken", str(e)
+        return "no_video", "no moov/moof", saw
+    return "ok", None, saw
 
 
 def container_status_zip(z, name, size):
-    """Audit a stored MP4 inside a ZIP without extracting it."""
+    """Audit a stored MP4 inside a ZIP without extracting it.
+    Returns (status, detail, fragmented) -- fragmented means moof boxes are
+    present, so the moov may lack the index ffmpeg/players need."""
     if size < 16:
-        return "empty", "%d bytes" % size
+        return "empty", "%d bytes" % size, False
     try:
         with z.open(name) as f:
             if not f.seekable():
-                return "unknown", "member not seekable"
-            return _walk_boxes(f, size)
+                return "unknown", "member not seekable", False
+            st, detail, saw = _walk_boxes(f, size)
+            return st, detail, (b"moof" in saw)
     except Exception as e:
-        return "broken", str(e)
+        return "broken", str(e), False
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +199,21 @@ def pick_encoder():
     return chosen
 
 
+def prep_video(src, tag=""):
+    """Flatten a fragmented MP4 in place so ffmpeg can open it. No-op if the
+    file is already a standard MP4. Returns True if it rewrote the index."""
+    if not _flatten_file:
+        return False
+    try:
+        r, _d = _flatten_file(src, backup=False, log=lambda *a, **k: None)
+    except Exception:
+        return False
+    if r == "repaired":
+        _say("     %-30s rebuilt video index (was fragmented)" % tag)
+        return True
+    return False
+
+
 def ff_remux(src, dst):
     """Lossless remux: recover a truncated/broken MP4 by copying streams."""
     r = subprocess.run(
@@ -205,16 +225,22 @@ def ff_remux(src, dst):
     return r.returncode == 0 and os.path.getsize(dst) > 0
 
 
-def ff_reencode(src, dst, target_mbps, threads=0, duration=None, tag=""):
+def ff_reencode(src, dst, target_mbps, threads=0, duration=None, tag="",
+                start_s=None, seg_s=None):
     t = max(1.0, min(float(target_mbps), 8.0))
     enc, extra = pick_encoder()
+    seek = (["-ss", "%.3f" % start_s] if start_s is not None else [])
+    seg = (["-t", "%.3f" % seg_s] if seg_s is not None else [])
+    if seg_s is not None:
+        duration = seg_s
 
     def run(name, ex):
         if name == "libx264":                             # cap CPU threads/job
             ex = [str(threads) if a == "0" else a for a in ex]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-               "-y", "-fflags", "+genpts+discardcorrupt", "-i", src,
-               "-map", "0:v:0", "-c:v", name,
+               "-y", "-fflags", "+genpts+discardcorrupt"] + seek + \
+              ["-i", src] + seg + \
+              ["-map", "0:v:0", "-c:v", name,
                "-b:v", "%dk" % int(t * 1000),
                "-maxrate", "8000k", "-bufsize", "8000k"] + ex + \
               ["-pix_fmt", "yuv420p", "-map", "0:a?", "-c:a", "copy",
@@ -302,6 +328,171 @@ def rescale_accel(data, factor):
 
 
 # --------------------------------------------------------------------------- #
+# splitting an over-length clip into spec-length chunks (time-synced)
+# --------------------------------------------------------------------------- #
+VTS_HEADER = 32
+VTS_ENTRY = {1: 12, 2: 24, 3: 24, 4: 36}
+TEL_HEADER = 32
+TEL_RECORD = 24
+
+
+def _vts_frames(data):
+    """(entry_size, [sof_ns per frame]) from a .vts, or (None, [])."""
+    if len(data) < VTS_HEADER or data[:8] != b"TRIVTS01":
+        return None, []
+    es = VTS_ENTRY.get(struct.unpack_from("<I", data, 8)[0])
+    if not es:
+        return None, []
+    n = (len(data) - VTS_HEADER) // es
+    sof = [struct.unpack_from("<Q", data, VTS_HEADER + i * es + 4)[0]
+           for i in range(n)]
+    return es, sof
+
+
+def _slice_vts(data, f0, f1):
+    """.vts covering frames [f0,f1) with frame_number rebased to 0-based."""
+    es = VTS_ENTRY[struct.unpack_from("<I", data, 8)[0]]
+    out = bytearray(data[:VTS_HEADER])
+    for j in range(f0, f1):
+        e = bytearray(data[VTS_HEADER + j * es: VTS_HEADER + (j + 1) * es])
+        struct.pack_into("<I", e, 0, j - f0)          # rebase frame_number
+        out += e
+    return bytes(out)
+
+
+def _slice_imu(data, ts_lo, ts_hi):
+    """.imu samples with timestamp in [ts_lo, ts_hi); header video_start updated."""
+    ss, n, _rate = _imu_meta(data)
+    if not ss:
+        return data
+    out = bytearray(data[:IMU_HEADER])
+    first_ts = None
+    for i in range(n):
+        p = IMU_HEADER + i * ss
+        ts = struct.unpack_from("<Q", data, p)[0]
+        if ts_lo <= ts < ts_hi:
+            if first_ts is None:
+                first_ts = ts
+            out += data[p:p + ss]
+    if first_ts is not None:
+        struct.pack_into("<Q", out, 20, first_ts)     # start_time_ns
+        struct.pack_into("<Q", out, 28, ts_lo)        # video_start_ns
+    return bytes(out)
+
+
+def _slice_tel(data, ts_lo, ts_hi):
+    """.tel records within the time window (best-effort; passthrough on error)."""
+    if len(data) < TEL_HEADER or not data[:7] == b"TRTEL01"[:7]:
+        return data
+    n = (len(data) - TEL_HEADER) // TEL_RECORD
+    out = bytearray(data[:TEL_HEADER])
+    kept = 0
+    for i in range(n):
+        p = TEL_HEADER + i * TEL_RECORD
+        ts = struct.unpack_from("<Q", data, p)[0]
+        if ts_lo <= ts < ts_hi:
+            out += data[p:p + TEL_RECORD]
+            kept += 1
+    struct.pack_into("<I", out, 16, kept)             # record_count
+    return bytes(out)
+
+
+def split_and_repair(z, names, info, meta, e, country, session, args, tag,
+                     out_path, tmpdir):
+    """Split an over-length clip into ~30-min chunks, each a standalone ZIP
+    with time-synced video + IMU + VTS. Returns a list of chunk basenames."""
+    mp4 = next((n for n in names if n.lower().endswith(".mp4")), None)
+    imu = next((n for n in names if n.lower().endswith(".imu")), None)
+    vts = next((n for n in names if n.lower().endswith(".vts")), None)
+    tel = next((n for n in names if n.lower().endswith(".tel")), None)
+    jsn = next((n for n in names if n.lower().endswith(".json")
+                and n != "metadata.json"), None)
+    readme = "README.md" if "README.md" in names else None
+
+    idata = z.read(imu) if imu else b""
+    vdata = z.read(vts) if vts else b""
+    tdata = z.read(tel) if tel else b""
+    jdata = z.read(jsn) if jsn else None
+    rdata = z.read(readme) if readme else None
+    es, sof = _vts_frames(vdata)
+    total_frames = len(sof)
+    dur = meta.get("duration_s") or 0
+    fps = (total_frames / dur) if dur else 30.0
+
+    target = max(120.0, args.split_minutes * 60.0)
+    n = max(2, math.ceil(dur / target))               # equal chunks, each <=target
+    _say("     %-30s splitting %.0fs into %d chunks (~%.0f min each)"
+         % (tag, dur, n, dur / n / 60.0))
+
+    # Extract the full video once; each chunk is re-encoded from it.
+    src = os.path.join(tmpdir, "full.mp4")
+    _say("     %-30s extracting video (%.1f GB)..."
+         % (tag, info[mp4].file_size / 1e9))
+    with z.open(mp4) as s, open(src, "wb") as o:
+        shutil.copyfileobj(s, o, 1 << 20)
+    prep_video(src, tag)                              # flatten so ffmpeg can read
+
+    base_zip = out_path[:-4] if out_path.lower().endswith(".zip") else out_path
+    orig_base = meta.get("clip_id") or os.path.basename(base_zip)
+    chunk_names = []
+    for k in range(n):
+        f0 = round(k * total_frames / n)
+        f1 = round((k + 1) * total_frames / n) if k < n - 1 else total_frames
+        if f1 <= f0:
+            continue
+        t0 = f0 / fps
+        seg = (f1 - f0) / fps
+        ts_lo = sof[f0] if sof and f0 < len(sof) else 0
+        ts_hi = (sof[f1] if sof and f1 < len(sof)
+                 else (sof[-1] + int(1e9 / fps) if sof else (1 << 63)))
+        cbase = "%s_chunk%02d" % (orig_base, k + 1)
+        _say("     %-30s chunk %d/%d  frames %d-%d  %.0f-%.0fs"
+             % (tag, k + 1, n, f0, f1, t0, t0 + seg))
+        cdst = os.path.join(tmpdir, "chunk%02d.mp4" % (k + 1))
+        ok = ff_reencode(src, cdst, args.reencode_mbps,
+                         getattr(args, "enc_threads", 0), tag="%s#%d" % (tag, k + 1),
+                         start_s=t0, seg_s=seg)
+        if not ok:
+            _say("     %-30s chunk %d re-encode FAILED" % (tag, k + 1))
+            continue
+        # sliced, time-synced sidecars
+        cimu = _slice_imu(idata, ts_lo, ts_hi) if idata else None
+        cvts = _slice_vts(vdata, f0, f1) if vdata else None
+        ctel = _slice_tel(tdata, ts_lo, ts_hi) if tdata else None
+        cmeta = json.loads(json.dumps(meta))         # deep copy
+        cmeta["clip_id"] = cbase
+        cmeta["duration_s"] = round(seg, 3)
+        cmeta["chunk"] = {"index": k + 1, "of": n, "source_clip": orig_base,
+                          "note": "one part of a longer recording, split to the "
+                                  "120-3600 s clip-length spec; IMU/VTS are the "
+                                  "matching time slice."}
+        _patch_metadata(cmeta, e, country, session, cdst, None, [])
+        czip = base_zip.replace(orig_base, cbase) if orig_base in base_zip \
+            else base_zip + ("_chunk%02d" % (k + 1))
+        czip = czip + ".zip"
+        tmp = czip + ".part"
+        with zipfile.ZipFile(tmp, "w", allowZip64=True) as zo:
+            zo.write(cdst, cbase + ".mp4", compress_type=zipfile.ZIP_STORED)
+            if cimu is not None:
+                zo.writestr(cbase + ".imu", cimu, zipfile.ZIP_STORED)
+            if cvts is not None:
+                zo.writestr(cbase + ".vts", cvts, zipfile.ZIP_STORED)
+            if ctel is not None:
+                zo.writestr(cbase + ".tel", ctel, zipfile.ZIP_DEFLATED)
+            if jdata is not None:
+                zo.writestr(cbase + ".json", jdata, zipfile.ZIP_DEFLATED)
+            zo.writestr("metadata.json", json.dumps(cmeta, indent=2) + "\n",
+                        zipfile.ZIP_DEFLATED)
+            if rdata is not None:
+                zo.writestr("README.md", rdata, zipfile.ZIP_DEFLATED)
+        os.replace(tmp, czip)
+        os.remove(cdst)
+        chunk_names.append(os.path.basename(czip))
+    os.remove(src)
+    return chunk_names
+
+
+# --------------------------------------------------------------------------- #
 # per-ZIP repair
 # --------------------------------------------------------------------------- #
 def repair_zip(zp, out_path, env, env_map, country, session, args):
@@ -337,8 +528,9 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
             dur = meta.get("duration_s")
             status = "no_mp4"
             br = None
+            fragmented = False
             if mp4:
-                status, _d = container_status_zip(z, mp4, size)
+                status, _d, fragmented = container_status_zip(z, mp4, size)
                 br = (size * 8 / dur / 1e6) if dur else None
             idata = z.read(imu) if (imu and not args.no_fix_imu) else None
             g = imu_gravity_and_rate(idata)[0] if idata else None
@@ -348,26 +540,52 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                         ("%.1f Mbps" % br) if br else "bitrate ?",
                         ("%.2f m/s^2" % g) if g is not None else "n/a"))
 
-            # ---- video: only extract when ffmpeg has to touch it ----
+            # ---- over-length clip: split into spec-length chunks ----
+            oversized = (mp4 and dur and status != "no_video"
+                         and dur > SPEC["clip_seconds"][1] and args.split)
+            if oversized and not have("ffmpeg"):
+                remaining.append("clip %.0fs > 1h -- needs ffmpeg to split"
+                                 % dur)
+            elif oversized and args.dry_run:
+                nch = max(2, math.ceil(dur / (args.split_minutes * 60.0)))
+                actions.append("split into %d chunks of ~%.0f min"
+                               % (nch, dur / nch / 60.0))
+                return _result(name, actions, remaining, dry=True)
+            elif oversized:
+                chunks = split_and_repair(z, names, info, meta, e, country,
+                                          session, args, tag, out_path, tmpdir)
+                z.close()
+                if out_path == zp and chunks:         # in place: replace orig
+                    os.remove(zp)
+                _say("OK  %-30s split into %d chunks: %s (%.0fs)"
+                     % (tag, len(chunks), ", ".join(chunks),
+                        time.monotonic() - t_start))
+                return _result(name, ["split into %d chunks: %s"
+                                      % (len(chunks), ", ".join(chunks))], [])
+
+            # ---- video: extract + flatten only when we must touch it ----
             new_mp4 = None
             if mp4:
-                ffm = have("ffmpeg")
-                need_fix = args.reencode or (status not in ("ok", "no_video"))
-                will_fix_video = need_fix and status != "no_video" and ffm
+                ffm = bool(have("ffmpeg"))
+                # A fragmented file needs its index rebuilt even without a
+                # re-encode -- a bad index is the "trun track id unknown" reject.
+                need_fix = (args.reencode or status not in ("ok", "no_video")
+                            or fragmented)
+                will_reencode = args.reencode and status != "no_video" and ffm
                 if status == "no_video":
                     remaining.append("no usable video (cannot repair)")
                 elif need_fix and not ffm:
                     remaining.append("%s video (ffmpeg not installed)" % status)
                 elif need_fix and args.dry_run:
                     actions.append("re-encode video to <=8 Mbps"
-                                   if args.reencode else
-                                   "remux %s video" % status)
+                                   if args.reencode else "rebuild/remux video")
                 elif need_fix:
                     src = os.path.join(tmpdir, "in.mp4")
                     _say("     %-30s extracting video (%.1f GB)..."
                          % (tag, size / 1e9))
                     with z.open(mp4) as s, open(src, "wb") as o:
                         shutil.copyfileobj(s, o, 1 << 20)
+                    prep_video(src, tag)             # flatten so ffmpeg can read
                     dst = os.path.join(tmpdir, "out.mp4")
                     if args.reencode and ff_reencode(
                             src, dst, args.reencode_mbps,
@@ -376,16 +594,16 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                         new_mp4 = dst
                         actions.append("re-encoded video to <=8 Mbps")
                     elif not args.reencode:
-                        _say("     %-30s remuxing %s video..." % (tag, status))
+                        _say("     %-30s remuxing video..." % tag)
                         if ff_remux(src, dst):
                             new_mp4 = dst
-                            actions.append("remuxed %s video" % status)
+                            actions.append("rebuilt/remuxed video (lossless)")
                         else:
                             remaining.append("video fix failed (%s)" % status)
                     else:
                         remaining.append("video fix failed (%s)" % status)
                     os.remove(src)
-                if not will_fix_video and br and br > SPEC["bitrate_mbps"][1] + 0.05:
+                if not will_reencode and br and br > SPEC["bitrate_mbps"][1] + 0.05:
                     remaining.append("bitrate %.1f Mbps > 8 (use re-encode)" % br)
                 if dur is not None and not (SPEC["clip_seconds"][0] <= dur
                                             <= SPEC["clip_seconds"][1]):
@@ -589,6 +807,14 @@ def build_parser():
                    help="Target bitrate for the re-encode (default 7, cap 8).")
     p.add_argument("--no-fix-imu", action="store_true",
                    help="Do not correct off-scale accelerometer data.")
+    p.add_argument("--split-minutes", type=float, default=30.0, metavar="M",
+                   help="Target chunk length when splitting a clip longer than "
+                        "1 hour (default 30). Each chunk becomes its own ZIP "
+                        "with a time-synced IMU/VTS slice.")
+    p.add_argument("--no-split", dest="split", action="store_false",
+                   default=True,
+                   help="Do not split over-length (>1 h) clips into chunks; "
+                        "flag them instead.")
     p.add_argument("--out", metavar="DIR",
                    help="Write repaired copies here instead of in place.")
     p.add_argument("--recursive", "-r", action="store_true")
