@@ -486,7 +486,7 @@ def _pick_h264_encoder():
     return chosen
 
 
-def reencode_video(src, dst, target_mbps, log):
+def reencode_video(src, dst, target_mbps, log, preset=None):
     """Transcode src -> dst as spec-compliant H.264 <=8 Mbps. Returns bool.
     Falls back to libx264 if the chosen (hardware) encoder fails at runtime."""
     ff = ffmpeg_path()
@@ -496,6 +496,9 @@ def reencode_video(src, dst, target_mbps, log):
     enc, extra = _pick_h264_encoder()
 
     def attempt(encoder, encoder_extra):
+        if encoder == "libx264" and preset:             # speed/size tradeoff
+            encoder_extra = [preset if a == "veryfast" else a
+                             for a in encoder_extra]
         cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
                "-fflags", "+genpts+discardcorrupt", "-i", src,
                "-map", "0:v:0", "-c:v", encoder,
@@ -1991,7 +1994,8 @@ def stage_and_reencode(clip, staging, args, log):
             root, ext = os.path.splitext(base)
             dst = os.path.join(staging, "%s_%d%s" % (root, len(staged), ext))
         if src.lower().endswith(".mp4"):
-            if reencode_video(src, dst, args.reencode_mbps, log):
+            if reencode_video(src, dst, args.reencode_mbps, log,
+                              preset=getattr(args, "reencode_preset", None)):
                 log.info("    re-encoded %s" % base)
             else:
                 # Fall back to a verbatim copy so the clip still ships.
@@ -2303,6 +2307,10 @@ known environment values (others are accepted with a warning):
     enc.add_argument("--reencode-mbps", type=float, default=7.0, metavar="N",
                      help="Target video bitrate for the re-encode (default 7; "
                           "hard-capped at 8 to stay inside the 6-8 spec).")
+    enc.add_argument("--reencode-preset", metavar="P", default="veryfast",
+                     help="libx264 speed preset for CPU encoding (default "
+                          "veryfast). Use 'ultrafast'/'superfast' for a big "
+                          "speed-up on machines without a GPU.")
     enc.add_argument("--no-fix-imu", action="store_true",
                      help="Do not correct an off-scale accelerometer. By "
                           "default, a clip whose at-rest gravity reads ~2x or "

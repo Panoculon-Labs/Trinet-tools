@@ -226,7 +226,7 @@ def ff_remux(src, dst):
 
 
 def ff_reencode(src, dst, target_mbps, threads=0, duration=None, tag="",
-                start_s=None, seg_s=None):
+                start_s=None, seg_s=None, preset=None):
     t = max(1.0, min(float(target_mbps), 8.0))
     enc, extra = pick_encoder()
     seek = (["-ss", "%.3f" % start_s] if start_s is not None else [])
@@ -237,6 +237,8 @@ def ff_reencode(src, dst, target_mbps, threads=0, duration=None, tag="",
     def run(name, ex):
         if name == "libx264":                             # cap CPU threads/job
             ex = [str(threads) if a == "0" else a for a in ex]
+            if preset:                                    # speed/size tradeoff
+                ex = [preset if a == "veryfast" else a for a in ex]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
                "-y", "-fflags", "+genpts+discardcorrupt"] + seek + \
               ["-i", src] + seg + \
@@ -451,7 +453,8 @@ def split_and_repair(z, names, info, meta, e, country, session, args, tag,
         cdst = os.path.join(tmpdir, "chunk%02d.mp4" % (k + 1))
         ok = ff_reencode(src, cdst, args.reencode_mbps,
                          getattr(args, "enc_threads", 0), tag="%s#%d" % (tag, k + 1),
-                         start_s=t0, seg_s=seg)
+                         start_s=t0, seg_s=seg,
+                         preset=getattr(args, "reencode_preset", None))
         if not ok:
             _say("     %-30s chunk %d re-encode FAILED" % (tag, k + 1))
             continue
@@ -603,7 +606,8 @@ def repair_zip(zp, out_path, env, env_map, country, session, args):
                     if args.reencode and ff_reencode(
                             src, dst, args.reencode_mbps,
                             getattr(args, "enc_threads", 0),
-                            duration=dur, tag=tag):
+                            duration=dur, tag=tag,
+                            preset=getattr(args, "reencode_preset", None)):
                         new_mp4 = dst
                         actions.append("re-encoded video to <=8 Mbps")
                     elif not args.reencode:
@@ -818,6 +822,11 @@ def build_parser():
                           "(over-bitrate files are then flagged, not fixed).")
     p.add_argument("--reencode-mbps", type=float, default=7.0, metavar="N",
                    help="Target bitrate for the re-encode (default 7, cap 8).")
+    p.add_argument("--reencode-preset", metavar="P", default="veryfast",
+                   help="libx264 speed preset for CPU encoding (default "
+                        "veryfast). Use 'ultrafast' or 'superfast' for a big "
+                        "speed-up on machines without a GPU. Ignored by "
+                        "hardware encoders.")
     p.add_argument("--no-fix-imu", action="store_true",
                    help="Do not correct off-scale accelerometer data.")
     p.add_argument("--split-minutes", type=float, default=30.0, metavar="M",
