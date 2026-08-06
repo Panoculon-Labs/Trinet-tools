@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Panoculon Labs. Part of Trinet-Tools.
-"""Single-view stereo visualization: stitched panorama + depth + orientation.
+"""Single-view stereo visualization: L|R feed + depth + orientation.
 
 One video, four channels of the take at once:
 
-  * **Stitched camera feed** — both fisheye eyes warped into one
-    equirectangular panorama through the calibrated Kannala-Brandt model and
-    the stereo extrinsic, feather-blended. The blend deliberately favours the
-    LEFT eye everywhere it has data and brings the right eye in only at the
-    periphery: the eyes are a 70 mm-baseline stereo pair, not a panoramic
-    rig, so a symmetric blend would ghost every near object by its parallax.
+  * **Left | right camera feed** — the two eyes side by side. Native
+    fisheye by default; `--rectified` shows the epipolar-aligned pair the
+    depth panel is actually computed from.
   * **SGBM + WLS depth** — the dense, edge-preserving disparity (metric,
     from the same calibration), turbo-mapped over an inverse-depth ramp.
   * **IMU orientation** — Madgwick attitude from the take's own inertial
@@ -20,7 +17,7 @@ One video, four channels of the take at once:
 
 Usage:
     python3 scripts/stereo_stitch_viz.py TAKE_PREFIX OUT.mp4 \
-        --calibration CALIB [--pano-hfov 165] [--pano-vfov 105] \
+        --calibration CALIB [--rectified] [--width 1280] \
         [--min-depth 0.25] [--max-depth 5.0] [--stride 1] [--no-audio]
 """
 
@@ -45,69 +42,6 @@ from trinet_tools import calib_blob                              # noqa: E402
 from trinet_tools.madgwick import run_madgwick                   # noqa: E402
 from trinet_tools.reader import read_imu, read_vts               # noqa: E402
 from trinet_tools.stereo_align import Rectification              # noqa: E402
-
-
-# ------------------------------------------------------------- panorama --
-def kb_project(dirs, K, D):
-    """Kannala-Brandt: (...,3) unit rays -> (...,2) pixels, plus validity."""
-    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
-    rxy = np.sqrt(x * x + y * y)
-    theta = np.arctan2(rxy, z)
-    k1, k2, k3, k4 = D
-    t2 = theta * theta
-    r = theta * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
-    scale = np.where(rxy > 1e-9, r / np.maximum(rxy, 1e-9), 0.0)
-    u = K[0, 0] * x * scale + K[0, 2]
-    v = K[1, 1] * y * scale + K[1, 2]
-    # the K-B polynomial is only monotonic out to its first stationary point
-    return u, v, (z > -0.2) & (theta < np.radians(100.0))
-
-
-def build_pano_maps(calib, W, H, hfov_deg, vfov_deg):
-    """Equirect grid -> per-eye remap tables and blend weights."""
-    def KD(cam):
-        it = cam["intrinsics"]
-        K = np.array([[it["fx"], 0, it["cx"]], [0, it["fy"], it["cy"]],
-                      [0, 0, 1]], dtype=np.float64)
-        D = np.array((list(it["distortion"]) + [0.0] * 4)[:4])
-        return K, D
-
-    K0, D0 = KD(calib["cameras"][0])
-    K1, D1 = KD(calib["cameras"][1])
-    R10 = np.array(calib["T_cam1_cam0"], dtype=np.float64)[:3, :3]
-
-    phi = np.linspace(-math.radians(hfov_deg) / 2,
-                      math.radians(hfov_deg) / 2, W)[None, :]
-    lam = np.linspace(math.radians(vfov_deg) / 2,
-                      -math.radians(vfov_deg) / 2, H)[:, None]
-    cl = np.cos(lam)
-    dirs = np.stack([np.sin(phi) * cl * np.ones_like(lam),
-                     -np.sin(lam) * np.ones_like(phi),
-                     np.cos(phi) * cl * np.ones_like(lam)], axis=-1)
-
-    u0, v0, ok0 = kb_project(dirs, K0, D0)
-    d1 = dirs @ R10.T                       # rotation-only stitch
-    u1, v1, ok1 = kb_project(d1, K1, D1)
-
-    w, h = calib["cameras"][0]["intrinsics"]["image_size"]
-    inb = lambda u, v: (u >= 0) & (u < w - 1) & (v >= 0) & (v < h - 1)
-    ok0 &= inb(u0, v0)
-    ok1 &= inb(u1, v1)
-
-    # Left eye dominant; the right eye only fades in where the left runs out.
-    # (A symmetric blend would double every near object by stereo parallax.)
-    ang = np.abs(phi) * np.ones_like(lam)
-    edge = math.radians(hfov_deg) / 2
-    w0 = np.clip((edge - ang) / max(math.radians(12.0), 1e-6), 0.0, 1.0)
-    w0 = np.where(ok0, np.maximum(w0, 0.15), 0.0)
-    w1 = np.where(ok1, 1.0 - w0, 0.0)
-    s = w0 + w1
-    w0 = np.where(s > 1e-6, w0 / np.maximum(s, 1e-6), 0.0)
-    w1 = np.where(s > 1e-6, w1 / np.maximum(s, 1e-6), 0.0)
-
-    m0 = (u0.astype(np.float32), v0.astype(np.float32))
-    m1 = (u1.astype(np.float32), v1.astype(np.float32))
-    return m0, m1, w0[..., None].astype(np.float32), w1[..., None].astype(np.float32)
 
 
 # ---------------------------------------------------------- orientation --
@@ -202,6 +136,30 @@ def draw_orientation(size, R, roll, pitch, yaw, gyro_dps):
     return img
 
 
+def sanitize_mag(mag):
+    """Repair magnetometer dropouts before they reach Madgwick.
+
+    The v5 IMU occasionally emits an all-zero magnetometer sample. Madgwick's
+    9-DOF update normalises that vector, so a single dropout divides by zero
+    and NaNs the quaternion for the WHOLE run (observed: 50 bad rows out of
+    48822 destroyed every attitude in the take). Hold the last valid reading
+    across dropouts; if the mag is mostly unusable, return None so the caller
+    falls back to 6-DOF.
+    """
+    if mag is None:
+        return None
+    m = np.asarray(mag, dtype=np.float64).copy()
+    good = np.isfinite(m).all(axis=1) & (np.linalg.norm(m, axis=1) > 1e-6)
+    if good.sum() < 0.5 * len(m):
+        return None
+    if not good.all():
+        idx = np.maximum.accumulate(np.where(good, np.arange(len(m)), -1))
+        idx[idx < 0] = int(good.argmax())          # leading dropouts
+        m = m[idx]
+        print(f"  [imu] repaired {int((~good).sum())} magnetometer dropouts")
+    return m
+
+
 def colorize_depth(disp, fx, baseline, lo, hi):
     depth = np.zeros_like(disp)
     good = disp > 0.5
@@ -228,9 +186,10 @@ def main():
     ap.add_argument("take")
     ap.add_argument("out")
     ap.add_argument("--calibration", type=Path, required=True)
-    ap.add_argument("--pano-hfov", type=float, default=152.0)
-    ap.add_argument("--pano-vfov", type=float, default=80.0)
-    ap.add_argument("--pano-width", type=int, default=1280)
+    ap.add_argument("--width", type=int, default=1280,
+                    help="output width; each eye gets half of it")
+    ap.add_argument("--rectified", action="store_true",
+                    help="show the rectified pair instead of raw fisheye")
     ap.add_argument("--depth-width", type=int, default=1280,
                     help="rectified width used for SGBM+WLS")
     ap.add_argument("--num-disp", type=int, default=128)
@@ -267,9 +226,16 @@ def main():
 
     # --- orientation for the whole take, sampled per frame ---
     ts_imu = np.asarray(imu.timestamps_ns, dtype=np.float64) / 1e9
-    mag = getattr(imu, "mag", None)
+    mag = sanitize_mag(getattr(imu, "mag", None))
     quats = run_madgwick(imu.accel, imu.gyro, mag, ts_imu,
                          use_mag=mag is not None)
+    if not np.isfinite(quats).all():
+        print("  [imu] 9-DOF attitude went non-finite - falling back to 6-DOF",
+              file=sys.stderr)
+        mag = None
+        quats = run_madgwick(imu.accel, imu.gyro, None, ts_imu, use_mag=False)
+    if not np.isfinite(quats).all():
+        sys.exit("attitude solution is non-finite even in 6-DOF")
     gyro_dps = np.degrees(np.asarray(imu.gyro))
     print(f"Madgwick attitude over {len(quats)} IMU samples "
           f"({'9-DOF' if mag is not None else '6-DOF'})")
@@ -293,11 +259,12 @@ def main():
     print(f"world up (measured) {np.round(up, 3)}; "
           f"camera pitched {math.degrees(math.asin(float(np.clip(np.dot(R_wc0 @ [0,0,1.], up), -1, 1)))):+.0f} deg at t0")
 
-    PW = args.pano_width
-    PH = int(round(PW * args.pano_vfov / args.pano_hfov)) & ~1
-    m0, m1, w0, w1 = build_pano_maps(calib, PW, PH,
-                                     args.pano_hfov, args.pano_vfov)
-    print(f"panorama {PW}x{PH} ({args.pano_hfov:.0f} x {args.pano_vfov:.0f} deg)")
+    PW = args.width
+    EW = (PW // 2) & ~1                      # per-eye width
+    EH = int(round(EW * 1080 / 1920)) & ~1
+    PH = EH
+    print(f"eyes {EW}x{EH} side by side "
+          f"({'rectified' if args.rectified else 'native fisheye'})")
 
     rect = Rectification(calib)
     DW = args.depth_width
@@ -316,8 +283,8 @@ def main():
     wls.setLambda(8000.0)
     wls.setSigmaColor(1.2)
 
-    # --- canvas: panorama on top, depth + orientation below ---
-    OW = PW
+    # --- canvas: L|R on top, depth + orientation below ---
+    OW = EW * 2
     dep_w = int(OW * 0.62) & ~1
     ori_w = OW - dep_w
     bot_h = int(dep_w * DH / DW) & ~1
@@ -359,9 +326,13 @@ def main():
         if cur[0] != il or cur[1] != ir:
             break
 
-        pano = (cv2.remap(frame[0], m0[0], m0[1], cv2.INTER_LINEAR) * w0 +
-                cv2.remap(frame[1], m1[0], m1[1], cv2.INTER_LINEAR) * w1)
-        pano = np.clip(pano, 0, 255).astype(np.uint8)
+        if args.rectified:
+            vl = rect.remap(frame[0], "l")
+            vr = rect.remap(frame[1], "r")
+        else:
+            vl, vr = frame[0], frame[1]
+        top = np.hstack([cv2.resize(vl, (EW, EH)), cv2.resize(vr, (EW, EH))])
+        cv2.line(top, (EW, 0), (EW, EH), (60, 60, 60), 1)
 
         rl = cv2.resize(rect.remap(frame[0], "l"), (DW, DH))
         rr = cv2.resize(rect.remap(frame[1], "r"), (DW, DH))
@@ -381,14 +352,16 @@ def main():
                                gyro_dps[k])
 
         canvas = np.zeros((OH, OW, 3), np.uint8)
-        canvas[:PH] = pano
+        canvas[:PH] = top
         canvas[PH:PH + bot_h, :dep_w] = cv2.resize(dep, (dep_w, bot_h))
         canvas[PH:PH + bot_h, dep_w:] = ori
         canvas[PH + bot_h:] = legend
-        label(canvas, "STITCHED STEREO PANORAMA", 14, 30)
+        tag = "RECTIFIED" if args.rectified else ""
+        label(canvas, f"LEFT {tag}".strip(), 14, 30)
+        label(canvas, f"RIGHT {tag}".strip(), EW + 14, 30)
         label(canvas, "SGBM + WLS DEPTH", 14, PH + 28)
         label(canvas, f"t {(ts - pairs[0][2]) / 1e9:6.2f} s", OW - 150, 30, 0.55)
-        label(canvas, "Panoculon Labs", 14, PH - 14, 0.7, (235, 235, 235))
+        label(canvas, "Panoculon Labs", 14, PH - 12, 0.62, (235, 235, 235))
         ff.stdin.write(canvas.tobytes())
         n += 1
         if n % 200 == 0:
