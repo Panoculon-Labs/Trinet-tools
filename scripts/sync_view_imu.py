@@ -154,7 +154,12 @@ def prep_orientation(loaded, R, timeshift_s, gyro_bias, accel_bias, target_hz=12
 def main():
     ap = argparse.ArgumentParser(description="Multi-camera synced viewer + per-camera Madgwick orientation")
     ap.add_argument("recordings", nargs="+")
-    ap.add_argument("--imu", required=True, help="calibration.json with extrinsics.R_cam_imu")
+    # --calib is the clearer name (it takes a path); --imu stays as an alias so
+    # existing commands keep working. Note sync_view.py's --imu is an on/off
+    # switch for its IMU strips — different flag, different script.
+    ap.add_argument("--calib", "--imu", dest="calib", required=True,
+                    metavar="CALIBRATION_JSON",
+                    help="calibration.json with extrinsics.R_cam_imu")
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--fps", type=float, default=29.65)
     ap.add_argument("--height", type=int, default=360, help="video panel height px")
@@ -170,7 +175,7 @@ def main():
     args = ap.parse_args()
     rotate_set = {int(i) for i in args.rotate180.split(",") if i.strip() != ""}
 
-    R, timeshift_s, gyro_bias, accel_bias = load_calib(args.imu)
+    R, timeshift_s, gyro_bias, accel_bias = load_calib(args.calib)
 
     cams, oris = [], []
     for r in args.recordings:

@@ -178,6 +178,30 @@ python scripts/sync_view.py --auto path/to/recordings -o take_sync.mp4
 python scripts/sync_view.py head.mp4 wristL.mp4 --show
 ```
 
+Add `--imu` to draw each camera's **accelerometer and gyroscope** under its
+panel, and `--audio` to carry a soundtrack through:
+
+```bash
+python scripts/sync_view.py head.mp4 wristL.mp4 wristR.mp4 \
+    --imu --audio master -o take_sync.mp4
+```
+
+The IMU strips read the `.imu` sidecars and place the samples on the *same*
+global clock as the frames (the same offset, and the same skew origin, the
+video uses), so an inertial event and the frame that saw it sit under one
+cursor across every panel. All cameras share one y-scale per quantity, so the
+panel with the tallest trace really is the one that moved most; that scale is
+fitted to a percentile band, so a single hard knock clips at the chart edge
+instead of flattening the rest of the take into a straight line. Tune with
+`--imu-h` (strip height, default 150 px) and `--imu-window` (visible half-width
+in seconds, default 2.0).
+
+`--audio` takes `none` (default), `master`, `mix`, or a 0-based panel index.
+Each source is seeked forward to the head of the cameras' shared overlap so it
+starts with the video. Audio rides the MP4's own audio/video alignment rather
+than the hardware frame timestamps — good enough to hear what happened, but the
+`.vts` timestamps, not the soundtrack, are the sync reference.
+
 To also show **each camera's orientation** on that timeline, use
 `sync_view_imu.py`. Below every video panel it draws a 3-axis gizmo of the
 camera's attitude, fused from its accelerometer and gyroscope (Madgwick) and
@@ -187,8 +211,12 @@ pipeline):
 
 ```bash
 python scripts/sync_view_imu.py head.mp4 wristL.mp4 wristR.mp4 \
-    --imu calibration.json -o take_oriented.mp4
+    --calib calibration.json -o take_oriented.mp4
 ```
+
+(That viewer's calibration flag is also accepted as `--imu` for backward
+compatibility — note it takes a *path* there, whereas `sync_view.py --imu` is a
+plain on/off switch.)
 
 Both viewers accept the same recording shapes as the other commands (a file
 triple, a chunk directory, or a SEI-extracted UVC MP4), and the group's master
