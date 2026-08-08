@@ -34,6 +34,18 @@ TRIMU_UUID = bytes([
 ])
 
 SEI_TYPE_USER_DATA_UNREGISTERED = 5
+
+# "TRINETAAC" — v4+ cameras embed stereo AAC-LC in its own
+# user_data_unregistered SEI NAL alongside the IMU SEI. Older cameras never
+# emit it, so an absent track is normal rather than an error. Layout after the
+# UUID: version(1) sample_rate(4 LE) channels(1) num_frames(2 LE), then per
+# frame pts_us(8 LE, CLOCK_MONOTONIC - the same clock as the IMU SEI's
+# frame_sof_ts_ns) len(2 LE) adts[len].
+TRINET_AAC_UUID = bytes([
+    0x54, 0x52, 0x49, 0x4E, 0x45, 0x54, 0x41, 0x41,
+    0x43, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+])
+AAC_SEI_HEADER_SIZE = 16 + 1 + 4 + 1 + 2
 H264_NAL_TYPE_SEI = 6
 IMU_SAMPLE_SIZE_V3 = 80
 # Byte offset of the trailing float32 within an 80-byte sample:
@@ -125,6 +137,33 @@ def remove_emulation_prevention(raw: bytes) -> bytes:
             out[oi] = raw[i]; oi += 1
             i += 1
     return bytes(out[:oi])
+
+
+def decode_trinet_aac_sei(nal: bytes):
+    """Return (sample_rate, channels, [(pts_us, adts_bytes)]) or None."""
+    raw = remove_emulation_prevention(nal)
+    idx = raw.find(TRINET_AAC_UUID[:9])          # match the ASCII prefix
+    if idx < 0 or idx + AAC_SEI_HEADER_SIZE > len(raw):
+        return None
+    p = raw[idx:]
+    sample_rate, = struct.unpack_from("<I", p, 17)
+    channels = p[21]
+    num_frames, = struct.unpack_from("<H", p, 22)
+    out = []
+    pos = AAC_SEI_HEADER_SIZE
+    for _ in range(num_frames):
+        if pos + 10 > len(p):
+            break
+        pts_us, = struct.unpack_from("<Q", p, pos)
+        ln, = struct.unpack_from("<H", p, pos + 8)
+        pos += 10
+        if pos + ln > len(p):
+            break
+        out.append((pts_us, p[pos:pos + ln]))
+        pos += ln
+    if not out:
+        return None
+    return sample_rate, channels, out
 
 
 def decode_trimu_sei(nal: bytes):
@@ -219,12 +258,19 @@ def extract(mp4: Path, out_dir: Path) -> None:
     fsync_seen = False
     mag_seen = False
 
+    aac_frames: list[bytes] = []      # ADTS frames in stream order
+    aac_rate = aac_channels = 0
+
     frame_idx = -1
     for off, length in split_nal_units(bitstream):
         header = bitstream[off]
         nal_type = header & 0x1F
         nal_bytes = bytes(bitstream[off:off + length])
         if nal_type == H264_NAL_TYPE_SEI:
+            audio = decode_trinet_aac_sei(nal_bytes)
+            if audio is not None:
+                aac_rate, aac_channels, aframes = audio
+                aac_frames.extend(a for _pts, a in aframes)
             result = decode_trimu_sei(nal_bytes)
             if result is not None:
                 samples_bytes, a_fs, g_fs, ver, nsamp, timing = result
@@ -361,14 +407,34 @@ def extract(mp4: Path, out_dir: Path) -> None:
     #    to bail after frame 1. Re-encode with libx264 to normalize the stream.
     video_dst = out_dir / "video.mp4"
     tmp_mp4 = out_dir / "_video_clean.mp4"
-    subprocess.check_call([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(mp4),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-an",
-        str(tmp_mp4),
-    ])
+
+    # The camera's audio rides in TRINETAAC SEI NALs, not in an audio track,
+    # and this re-encode strips every SEI — so the ADTS frames collected above
+    # are written out and muxed back in as a real track. Without this the
+    # recording is silent even though the camera sent audio (the Android SDK
+    # does the equivalent in Mp4Writer.writeAudioSample).
+    aac_path = out_dir / "_audio.aac"
+    have_audio = bool(aac_frames)
+    if have_audio:
+        with open(aac_path, "wb") as f:
+            for a in aac_frames:
+                f.write(a)
+        print(f"[extract] audio: {len(aac_frames)} AAC frames, "
+              f"{aac_rate} Hz, {aac_channels} ch")
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4)]
+    if have_audio:
+        cmd += ["-i", str(aac_path)]
+    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
+    if have_audio:
+        # -c:a copy keeps the camera's AAC bit-exact; no second lossy pass.
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-shortest"]
+    else:
+        cmd += ["-an"]
+    cmd += [str(tmp_mp4)]
+    subprocess.check_call(cmd)
     tmp_mp4.replace(video_dst)
+    aac_path.unlink(missing_ok=True)
 
     # 5. Count actually-decodable frames and drop leading VTS entries
     #    that were discarded during re-encode so frame 0 aligns.
