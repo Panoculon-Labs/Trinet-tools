@@ -74,13 +74,19 @@ def _usb_ids_for(node: str):
 
 
 def _does_h264_capture(node: str) -> bool:
-    """A UVC camera exposes several video nodes; only some do H.264 capture."""
+    """A UVC camera exposes several video nodes; only some do H.264 capture.
+
+    Must use --list-formats: --all reports the capability bits ("Video
+    Capture") but does NOT enumerate pixel formats, so it can never show
+    H264. On a Trinet the metadata node also reports "Video Capture" with an
+    empty format list, which is exactly what this has to filter out.
+    """
     try:
-        out = subprocess.run(["v4l2-ctl", "-d", node, "--all"],
+        out = subprocess.run(["v4l2-ctl", "-d", node, "--list-formats"],
                              capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return False
-    return "Video Capture" in out and "H264" in out.upper()
+    return "H264" in out.upper()
 
 
 def find_trinet_nodes() -> list[tuple[str, str]]:
