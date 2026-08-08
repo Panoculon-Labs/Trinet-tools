@@ -386,13 +386,27 @@ def extract(mp4: Path, out_dir: Path) -> None:
         print(f"[extract] libx264 dropped {drop} leading frame(s); re-aligning frames.bin")
         with open(vts_path, "rb") as f:
             vts_data = f.read()
-        entry_size = 24
+        # Entry layout MUST follow the version stamped in the header we just
+        # wrote: v4 (v6 cameras) is 36 bytes and carries the mid-exposure
+        # timing block, v2 is 24. Assuming v2 here silently truncated every
+        # v6 recording -- it re-packed 36-byte entries at a 24-byte stride,
+        # so the reader (which uses the header version) saw a wrong entry
+        # count and garbage sof/exposure, and rolling-shutter correction
+        # was lost.
+        if vts_version >= 4:
+            entry_size, entry_fmt = 36, "<IQIQIII"
+        else:
+            entry_size, entry_fmt = 24, "<IQIQ"
         body = vts_data[32:]
         new_body = bytearray()
         for i in range(decoded):
             src = body[(i + drop) * entry_size:(i + drop + 1) * entry_size]
-            _, sof, _, pts = struct.unpack("<IQIQ", src)
-            new_body += struct.pack("<IQIQ", i, sof, i, pts)
+            if len(src) < entry_size:
+                break
+            fields = list(struct.unpack(entry_fmt, src))
+            fields[0] = i          # frame_number
+            fields[2] = i          # venc_seq
+            new_body += struct.pack(entry_fmt, *fields)
         with open(vts_path, "wb") as f:
             f.write(vts_data[:32])
             f.write(new_body)
