@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -144,15 +145,20 @@ def ffprobe_fps(mp4: Path) -> float:
 
 def split_nal_units(data: bytes):
     """Yield (offset_after_startcode, nal_length) for each NAL in an Annex-B stream."""
+    # C-speed scan: find every 00 00 01, then classify whether a leading 00
+    # makes it a 4-byte start code. Semantically identical to the original
+    # byte-at-a-time walk (which cost seconds on 100 MB streams).
     starts = []
     i, n = 0, len(data)
-    while i + 2 < n:
-        if data[i] == 0 and data[i + 1] == 0:
-            if i + 3 < n and data[i + 2] == 0 and data[i + 3] == 1:
-                starts.append((i, 4)); i += 4; continue
-            if data[i + 2] == 1:
-                starts.append((i, 3)); i += 3; continue
-        i += 1
+    while True:
+        j = data.find(b"\x00\x00\x01", i)
+        if j < 0:
+            break
+        if j > 0 and data[j - 1] == 0:
+            starts.append((j - 1, 4))
+        else:
+            starts.append((j, 3))
+        i = j + 3
     for idx, (off, sc_len) in enumerate(starts):
         s = off + sc_len
         e = starts[idx + 1][0] if idx + 1 < len(starts) else n
@@ -514,6 +520,13 @@ def extract(mp4: Path, out_dir: Path) -> None:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4)]
     if have_audio:
         cmd += ["-itsoffset", f"{audio_delay_s:.6f}", "-i", str(aac_path)]
+    # Encoder settings are part of the calibration chain: recovered fx moves
+    # 2-4 px under ANY re-encode change (superfast/crf16, veryfast/crf17 and
+    # h264_vaapi all A/B-failed at a <1 px bar on 2026-08-12 — SUBPIX corners
+    # integrate the compression noise). Do not touch preset/crf/threads
+    # without an A/B against a stored capture; the real fix is detecting
+    # corners on the original stream so the re-encode leaves the accuracy
+    # chain entirely.
     cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-pix_fmt", "yuv420p", "-fps_mode:v", "passthrough"]
     filters = []
@@ -577,19 +590,26 @@ def extract(mp4: Path, out_dir: Path) -> None:
 
     #    Decodability sanity check (verification only — NEVER used to shift
     #    the timeline; the frame<->entry mapping comes from ffprobe_decode_map).
-    import cv2  # imported late to avoid an unnecessary dependency on --help
-    cap = cv2.VideoCapture(str(video_dst))
-    decoded = 0
-    while True:
-        ok, _ = cap.read()
-        if not ok:
-            break
-        decoded += 1
-    cap.release()
-    if decoded != len(kept_pkts):
-        print(f"[extract] WARNING: OpenCV decodes only {decoded}/{len(kept_pkts)} "
-              f"frames of {video_dst.name}")
-    print(f"[extract] wrote {video_dst} ({decoded} decodable frames)")
+    #    Costs a third full decode (~7 s/unit), and the calibration pipeline
+    #    re-decodes this file minutes later anyway (a truncated write shows
+    #    up there as "0 usable frames") — so it's opt-in for debugging.
+    if os.environ.get("EXTRACT_VERIFY") == "1":
+        import cv2  # imported late to avoid an unnecessary dependency
+        cap = cv2.VideoCapture(str(video_dst))
+        decoded = 0
+        while True:
+            ok, _ = cap.read()
+            if not ok:
+                break
+            decoded += 1
+        cap.release()
+        if decoded != len(kept_pkts):
+            print(f"[extract] WARNING: OpenCV decodes only "
+                  f"{decoded}/{len(kept_pkts)} frames of {video_dst.name}")
+        print(f"[extract] wrote {video_dst} ({decoded} decodable frames)")
+    else:
+        print(f"[extract] wrote {video_dst} "
+              f"({len(kept_pkts)} frames, verify skipped)")
 
     # 6. Cleanup
     try:
