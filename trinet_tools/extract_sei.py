@@ -22,6 +22,7 @@ TRINETIMUSEI UUID as written by the Trinet camera.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import struct
 import subprocess
@@ -87,6 +88,43 @@ def ffprobe_packet_pts_us(mp4: Path) -> list[int]:
             continue
         pts_us.append(int(round(t * 1e6)))
     return pts_us
+
+
+def ffprobe_decode_map(mp4: Path) -> list[int]:
+    """Decode the video stream and return, for each decoded frame in order,
+    the index of the source packet it came from (matched by byte position).
+
+    This is the exact frame<->packet correspondence: if the decoder skips
+    undecodable packets (e.g. a capture that joined mid-GOP), the skipped
+    packets simply never appear in the list. Never infer the mapping from
+    frame counts -- assuming a count shortfall sits at the head is what
+    silently time-shifted every frame of 4-cam rig captures by ~2.5 s.
+    """
+    out = subprocess.check_output(
+        ["ffprobe", "-hide_banner", "-loglevel", "error",
+         "-select_streams", "v:0",
+         "-show_packets", "-show_frames",
+         "-show_entries", "packet=pos:frame=pkt_pos",
+         "-of", "json", str(mp4)])
+    items = json.loads(out).get("packets_and_frames", [])
+    pkt_pos: list[int] = []
+    frame_pos: list[int] = []
+    for it in items:
+        if it.get("type") == "packet" and "pos" in it:
+            pkt_pos.append(int(it["pos"]))
+        elif it.get("type") == "frame" and "pkt_pos" in it:
+            frame_pos.append(int(it["pkt_pos"]))
+    idx_of = {pos: i for i, pos in enumerate(pkt_pos)}
+    return [idx_of[p] for p in frame_pos if p in idx_of]
+
+
+def ffprobe_packet_count(mp4: Path) -> int:
+    out = subprocess.check_output(
+        ["ffprobe", "-hide_banner", "-loglevel", "error",
+         "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets",
+         "-of", "csv=print_section=0", str(mp4)], text=True)
+    return int(out.strip() or 0)
 
 
 def ffprobe_fps(mp4: Path) -> float:
@@ -258,7 +296,9 @@ def extract(mp4: Path, out_dir: Path) -> None:
     fsync_seen = False
     mag_seen = False
 
-    aac_frames: list[bytes] = []      # ADTS frames in stream order
+    # ADTS frames in stream order, with their device-clock PTS (us, same
+    # CLOCK_MONOTONIC base as the IMU SEI's frame_sof_ts_ns).
+    aac_pts_frames: list[tuple[int, bytes]] = []
     aac_rate = aac_channels = 0
 
     frame_idx = -1
@@ -270,7 +310,7 @@ def extract(mp4: Path, out_dir: Path) -> None:
             audio = decode_trinet_aac_sei(nal_bytes)
             if audio is not None:
                 aac_rate, aac_channels, aframes = audio
-                aac_frames.extend(a for _pts, a in aframes)
+                aac_pts_frames.extend(aframes)
             result = decode_trimu_sei(nal_bytes)
             if result is not None:
                 samples_bytes, a_fs, g_fs, ver, nsamp, timing = result
@@ -359,76 +399,131 @@ def extract(mp4: Path, out_dir: Path) -> None:
             f.write(blob)
     print(f"[extract] wrote {imu_path} ({imu_path.stat().st_size} bytes, rate≈{imu_rate_hz} Hz)")
 
-    # 3. Write frames.bin. v6 cameras carry a per-frame mid-exposure timing block
-    #    -> emit TRIVTS01 v4 (sof + exposure + flags + readout). Older cameras ->
-    #    TRIVTS01 v2 (sof from the frame-sync delay, or 0 / PTS-fallback on v5).
-    use_v6 = imu_version >= 6
-    vts_version = 4 if use_v6 else 2
-    vts_header = struct.pack(
-        "<8sII16s", b"TRIVTS01", vts_version, int(round(fps * 1000)), b"\x00" * 16,
-    )
-    vts_path = out_dir / "frames.bin"
-    n_frames = len(per_frame_samples)
-    if len(pts_us) < n_frames:
+    # 3. Session-start backlog trim + exact frame<->packet mapping.
+    #
+    #    At STREAMON the camera flushes the encoded-frame queue left over from
+    #    the previous streaming session: ~1-3 s of frames whose SEI sof is
+    #    correct *for their old content* and therefore older than the live IMU
+    #    samples delivered alongside them by the whole idle gap (seconds to
+    #    hours). They are stale pictures and put a giant time gap at the head
+    #    of the frame timeline, so drop every frame up to the last stale one.
+    #    The IMU samples embedded in their SEIs are current and were all kept
+    #    in imu.bin above. (Detectable on v6 cameras only -- older SEI
+    #    versions carry no per-frame sof to compare against.)
+    n_frames_total = len(per_frame_samples)
+    STALE_SOF_NS = 500_000_000          # sof lagging its own samples by >0.5 s
+    head_trim = 0
+    for i in range(min(n_frames_total, int(15 * max(fps, 1.0)))):
+        timing = per_frame_timing[i]
+        first_ts = per_frame_first_sample_ts[i]
+        if (timing is not None and first_ts > 0
+                and first_ts - int(timing[0]) > STALE_SOF_NS):
+            head_trim = i + 1
+    if head_trim:
+        print(f"[extract] dropping {head_trim} stale head frame(s) "
+              f"(previous session's backlog, flushed at stream start)")
+
+    #    Exact mapping of decoded frames to source packets (by byte position):
+    #    the re-encode below consumes the decoder output in order, so output
+    #    frame n came from packet dec2pkt[n0 + n].
+    dec2pkt = ffprobe_decode_map(mp4)
+    if len(dec2pkt) < len(pts_us):
+        print(f"[extract] decoder skipped {len(pts_us) - len(dec2pkt)} "
+              f"undecodable packet(s)")
+    n0 = next((n for n, p in enumerate(dec2pkt) if p >= head_trim),
+              len(dec2pkt))
+    kept_pkts = dec2pkt[n0:]
+
+    if len(pts_us) < n_frames_total:
         # Pad using nominal fps if ffprobe missed some packets.
         step_us = int(round(1e6 / max(fps, 1.0)))
         last = pts_us[-1] if pts_us else 0
-        while len(pts_us) < n_frames:
+        while len(pts_us) < n_frames_total:
             last += step_us
             pts_us.append(last)
 
-    with open(vts_path, "wb") as f:
-        f.write(vts_header)
-        for i in range(n_frames):
-            timing = per_frame_timing[i]
-            if use_v6 and timing is not None:
-                sof_ns, exposure_us, flags, readout_us = timing
-                # v4 entry: v2 fields + exposure_us, entry_flags, readout_time_us.
-                # sof is the device mid-exposure frame time (already exposure-centred).
-                entry = struct.pack("<IQIQIII", i, int(sof_ns), i, int(pts_us[i]),
-                                    int(exposure_us), int(flags), int(readout_us))
-            elif use_v6:
-                entry = struct.pack("<IQIQIII", i, 0, i, int(pts_us[i]), 0, 0, 0)
-            else:
-                first_ts = per_frame_first_sample_ts[i]
-                fsync_us = per_frame_first_sample_fsync_us[i]
-                # v3/v4 cameras: sof = first sample time - frame-sync delay. v5
-                # cameras have no frame-sync delay -> sof=0, readers fall back to PTS.
-                sof_ns = (int(first_ts - fsync_us * 1000.0)
-                          if (imu_version < 5 and first_ts > 0) else 0)
-                entry = struct.pack("<IQIQ", i, sof_ns, i, int(pts_us[i]))
-            f.write(entry)
-    print(f"[extract] wrote {vts_path} ({vts_path.stat().st_size} bytes, "
-          f"{n_frames} entries, TRIVTS01 v{vts_version})")
-
-    # 4. Build a clean video.mp4 that OpenCV can decode end-to-end.
-    #    Android-wrapped Trinet MP4s often have leading access units that
-    #    libavcodec's H.264 decoder refuses, causing `cv2.VideoCapture.read()`
-    #    to bail after frame 1. Re-encode with libx264 to normalize the stream.
+    # 4. Build a clean video.mp4 that OpenCV can decode end-to-end, with the
+    #    stale head frames dropped. Android-wrapped Trinet MP4s often have
+    #    leading access units that libavcodec's H.264 decoder refuses, causing
+    #    `cv2.VideoCapture.read()` to bail after frame 1. Re-encode with
+    #    libx264 to normalize the stream; -fps_mode passthrough so the
+    #    encoder/muxer never drops or duplicates frames on its own.
     video_dst = out_dir / "video.mp4"
     tmp_mp4 = out_dir / "_video_clean.mp4"
 
     # The camera's audio rides in TRINETAAC SEI NALs, not in an audio track,
     # and this re-encode strips every SEI — so the ADTS frames collected above
-    # are written out and muxed back in as a real track. Without this the
-    # recording is silent even though the camera sent audio (the Android SDK
-    # does the equivalent in Mp4Writer.writeAudioSample).
+    # are written out and muxed back in as a real track. Audio capture starts
+    # a few seconds after video, so the track is placed at its true offset on
+    # the shared device clock. NEVER pass -shortest here: it truncated the
+    # audio/video length difference off the *video tail*, and the old
+    # count-based realign then mis-attributed the loss to the head, silently
+    # time-shifting the whole frame timeline by seconds.
     aac_path = out_dir / "_audio.aac"
-    have_audio = bool(aac_frames)
+    have_audio = bool(aac_pts_frames)
+    audio_delay_s = 0.0
+    if have_audio:
+        # Device-clock time of the first kept video frame.
+        ref_ns = 0
+        for i in (kept_pkts or range(n_frames_total)):
+            if i >= n_frames_total:
+                break
+            t = per_frame_timing[i]
+            if t is not None and t[0] > 0:
+                ref_ns = int(t[0])
+                break
+            if per_frame_first_sample_ts[i] > 0:
+                ref_ns = per_frame_first_sample_ts[i]
+                break
+        if ref_ns:
+            # Drop audio from before the kept video start, then place the
+            # remainder at its residual offset (device clocks cancel).
+            k0 = 0
+            while (k0 < len(aac_pts_frames)
+                   and aac_pts_frames[k0][0] * 1000 < ref_ns):
+                k0 += 1
+            aac_pts_frames = aac_pts_frames[k0:]
+            have_audio = bool(aac_pts_frames)
+            if have_audio:
+                # The re-encode synthesizes a video timeline starting at 0, so
+                # the audio offset is just the device-clock difference.
+                audio_delay_s = (aac_pts_frames[0][0] * 1000 - ref_ns) / 1e9
     if have_audio:
         with open(aac_path, "wb") as f:
-            for a in aac_frames:
+            for _pts, a in aac_pts_frames:
                 f.write(a)
-        print(f"[extract] audio: {len(aac_frames)} AAC frames, "
-              f"{aac_rate} Hz, {aac_channels} ch")
+        print(f"[extract] audio: {len(aac_pts_frames)} AAC frames, "
+              f"{aac_rate} Hz, {aac_channels} ch, +{audio_delay_s:.3f} s offset")
+
+    # The capture's container PTS are USB *arrival* times: the session-start
+    # backlog arrives as a wire-speed burst with duplicated/non-monotonic PTS
+    # that make downstream muxers and decoders reorder frames unpredictably.
+    # Synthesize a clean uniform timeline in encode order instead (setpts) --
+    # every consumer of video.mp4 is frame-indexed and gets real per-frame
+    # times from frames.bin, so container timestamps only need to be sane.
+    # The frame period comes from the camera's own sof deltas when available.
+    true_fps = fps
+    sof_kept = [int(per_frame_timing[i][0]) for i in kept_pkts
+                if i < n_frames_total and per_frame_timing[i] is not None]
+    sof_d = sorted(b - a for a, b in zip(sof_kept, sof_kept[1:]) if b > a)
+    if sof_d:
+        med = sof_d[len(sof_d) // 2]
+        if med > 0 and 1.0 <= 1e9 / med <= 240.0:
+            true_fps = 1e9 / med
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4)]
     if have_audio:
-        cmd += ["-i", str(aac_path)]
-    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"]
+        cmd += ["-itsoffset", f"{audio_delay_s:.6f}", "-i", str(aac_path)]
+    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-fps_mode:v", "passthrough"]
+    filters = []
+    if n0 > 0:
+        filters.append(f"select=gte(n\\,{n0})")
+    filters.append(f"setpts=N/({true_fps:.6f}*TB)")
+    cmd += ["-vf", ",".join(filters)]
     if have_audio:
         # -c:a copy keeps the camera's AAC bit-exact; no second lossy pass.
-        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-shortest"]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
     else:
         cmd += ["-an"]
     cmd += [str(tmp_mp4)]
@@ -436,8 +531,52 @@ def extract(mp4: Path, out_dir: Path) -> None:
     tmp_mp4.replace(video_dst)
     aac_path.unlink(missing_ok=True)
 
-    # 5. Count actually-decodable frames and drop leading VTS entries
-    #    that were discarded during re-encode so frame 0 aligns.
+    # 5. Verify the produced frame count against the mapping, then write
+    #    frames.bin with one entry per video.mp4 frame, in the same order.
+    #    v6 cameras carry a per-frame mid-exposure timing block -> emit
+    #    TRIVTS01 v4 (sof + exposure + flags + readout). Older cameras ->
+    #    TRIVTS01 v2 (sof from the frame-sync delay, or 0 / PTS-fallback
+    #    on v5).
+    out_n = ffprobe_packet_count(video_dst)
+    if out_n != len(kept_pkts):
+        print(f"[extract] WARNING: re-encode produced {out_n} frames, "
+              f"expected {len(kept_pkts)} -- truncating the map at the tail")
+        kept_pkts = kept_pkts[:out_n]
+
+    use_v6 = imu_version >= 6
+    vts_version = 4 if use_v6 else 2
+    vts_header = struct.pack(
+        "<8sII16s", b"TRIVTS01", vts_version, int(round(fps * 1000)), b"\x00" * 16,
+    )
+    vts_path = out_dir / "frames.bin"
+    with open(vts_path, "wb") as f:
+        f.write(vts_header)
+        for i, pkt in enumerate(kept_pkts):
+            timing = per_frame_timing[pkt] if pkt < n_frames_total else None
+            pts_i = int(pts_us[pkt]) if pkt < len(pts_us) else 0
+            if use_v6 and timing is not None:
+                sof_ns, exposure_us, flags, readout_us = timing
+                # v4 entry: v2 fields + exposure_us, entry_flags, readout_time_us.
+                # sof is the device mid-exposure frame time (already exposure-centred).
+                entry = struct.pack("<IQIQIII", i, int(sof_ns), i, pts_i,
+                                    int(exposure_us), int(flags), int(readout_us))
+            elif use_v6:
+                entry = struct.pack("<IQIQIII", i, 0, i, pts_i, 0, 0, 0)
+            else:
+                first_ts = per_frame_first_sample_ts[pkt] if pkt < n_frames_total else 0
+                fsync_us = (per_frame_first_sample_fsync_us[pkt]
+                            if pkt < n_frames_total else 0.0)
+                # v3/v4 cameras: sof = first sample time - frame-sync delay. v5
+                # cameras have no frame-sync delay -> sof=0, readers fall back to PTS.
+                sof_ns = (int(first_ts - fsync_us * 1000.0)
+                          if (imu_version < 5 and first_ts > 0) else 0)
+                entry = struct.pack("<IQIQ", i, sof_ns, i, pts_i)
+            f.write(entry)
+    print(f"[extract] wrote {vts_path} ({vts_path.stat().st_size} bytes, "
+          f"{len(kept_pkts)} entries, TRIVTS01 v{vts_version})")
+
+    #    Decodability sanity check (verification only — NEVER used to shift
+    #    the timeline; the frame<->entry mapping comes from ffprobe_decode_map).
     import cv2  # imported late to avoid an unnecessary dependency on --help
     cap = cv2.VideoCapture(str(video_dst))
     decoded = 0
@@ -447,35 +586,9 @@ def extract(mp4: Path, out_dir: Path) -> None:
             break
         decoded += 1
     cap.release()
-    drop = n_frames - decoded
-    if drop > 0:
-        print(f"[extract] libx264 dropped {drop} leading frame(s); re-aligning frames.bin")
-        with open(vts_path, "rb") as f:
-            vts_data = f.read()
-        # Entry layout MUST follow the version stamped in the header we just
-        # wrote: v4 (v6 cameras) is 36 bytes and carries the mid-exposure
-        # timing block, v2 is 24. Assuming v2 here silently truncated every
-        # v6 recording -- it re-packed 36-byte entries at a 24-byte stride,
-        # so the reader (which uses the header version) saw a wrong entry
-        # count and garbage sof/exposure, and rolling-shutter correction
-        # was lost.
-        if vts_version >= 4:
-            entry_size, entry_fmt = 36, "<IQIQIII"
-        else:
-            entry_size, entry_fmt = 24, "<IQIQ"
-        body = vts_data[32:]
-        new_body = bytearray()
-        for i in range(decoded):
-            src = body[(i + drop) * entry_size:(i + drop + 1) * entry_size]
-            if len(src) < entry_size:
-                break
-            fields = list(struct.unpack(entry_fmt, src))
-            fields[0] = i          # frame_number
-            fields[2] = i          # venc_seq
-            new_body += struct.pack(entry_fmt, *fields)
-        with open(vts_path, "wb") as f:
-            f.write(vts_data[:32])
-            f.write(new_body)
+    if decoded != len(kept_pkts):
+        print(f"[extract] WARNING: OpenCV decodes only {decoded}/{len(kept_pkts)} "
+              f"frames of {video_dst.name}")
     print(f"[extract] wrote {video_dst} ({decoded} decodable frames)")
 
     # 6. Cleanup
