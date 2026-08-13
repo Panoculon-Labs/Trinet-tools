@@ -31,7 +31,9 @@ CFG="${3:-ov_config}"
 }
 mkdir -p "$WORK/ov_out"
 
+# OV_CAMS=1 OV_STEREO=false for mono-inertial recordings (default stereo)
 docker run --rm --entrypoint /bin/bash \
+  -e "OV_CAMS=${OV_CAMS:-2}" -e "OV_STEREO=${OV_STEREO:-true}" \
   -v "$WORK":/data \
   trinet-openvins:latest -lc "
     source /opt/ros/noetic/setup.bash
@@ -52,7 +54,7 @@ docker run --rm --entrypoint /bin/bash \
     roslaunch /tmp/serial_trinet.launch \
       config_path:=/data/$CFG/estimator_config.yaml \
       bag:=/data/$BAG bag_start:=0 \
-      max_cameras:=2 use_stereo:=true \
+      max_cameras:=\${OV_CAMS:-2} use_stereo:=\${OV_STEREO:-true} \
       dosave:=true path_est:=/data/ov_out/traj_est.txt \
       dolivetraj:=false path_gt:=/dev/null \
       dataset:=trinet verbosity:=INFO
