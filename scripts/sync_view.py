@@ -30,6 +30,10 @@ Usage:
     # live preview instead of writing a file
     python scripts/sync_view.py head.mp4 wristL.mp4 --show
 
+    # upside-down-mounted wrist cams: flip those panels, and brand the output
+    python scripts/sync_view.py wristL.mp4 head.mp4 wristR.mp4 \
+        --rotate180 0,2 --watermark "Panoculon Labs" -o take.mp4
+
 Reads:  <rec>.mp4 + <rec>.vts (+ optional <rec>.imu for --imu, optional
         <rec>.json for labels), or a chunk directory containing
         partNNN.{mp4,vts,imu}.
@@ -359,7 +363,8 @@ def _shared_span(arrays, pct=99.0, pad_frac=0.08):
 
 
 def render(cams, args):
-    rotate_set = getattr(args, "rotate_set", set())
+    rotate_set = {int(i) for i in getattr(args, "rotate180", "").split(",")
+                  if i.strip() != ""}
     # Common timeline = overlap of all cameras on the global clock.
     t0 = max(c.t_start for c in cams)
     t1 = min(c.t_end for c in cams)
@@ -493,6 +498,12 @@ def render(cams, args):
         _put(canvas, f"self-rep ~{q} us  |  frame spread {spread_ms:+5.2f} ms",
              (total_w - 360, 23), 0.5, ACCENT if spread_ms < 2.0 else WARN)
 
+        if args.watermark:
+            (tw, _), _ = cv2.getTextSize(args.watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            wx, wy = total_w - tw - 14, HEADER_H + args.height - 12
+            cv2.putText(canvas, args.watermark, (wx + 1, wy + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, args.watermark, (wx, wy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
         if args.show:
             cv2.imshow("trinet sync view", canvas)
             if cv2.waitKey(max(1, int(1000 / args.fps))) & 0xFF in (27, ord("q")):
@@ -591,6 +602,10 @@ def main():
     ap.add_argument("-o", "--output", help="output .mp4 (default <first>_sync.mp4)")
     ap.add_argument("--fps", type=float, default=30.0, help="output fps (default 30)")
     ap.add_argument("--height", type=int, default=480, help="panel height px (default 480)")
+    ap.add_argument("--rotate180", default="",
+                    help="comma list of 0-based panel indices whose video to rotate 180 "
+                         "(e.g. inverted-mounted wrist cams): --rotate180 0,2")
+    ap.add_argument("--watermark", default="", help="watermark text (bottom-right of the video area)")
     ap.add_argument("--show", action="store_true", help="live preview instead of writing a file")
     ap.add_argument("--rotate180", default="",
                     help="comma list of 0-based panel indices whose video to rotate 180 "
