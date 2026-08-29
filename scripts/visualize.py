@@ -200,6 +200,7 @@ def main():
     parser.add_argument("--end", type=float, default=0, help="End time in seconds (0 = full)")
     parser.add_argument("--plots", type=str, default="orientation,accel,gyro,mag,sync_delay",
                         help="Comma-separated: orientation,accel,gyro,mag,temp,sync_delay")
+    parser.add_argument("--watermark", default="", help="watermark text (bottom-right)")
     parser.add_argument(
         "--orientation",
         choices=("madgwick", "gyro"),
@@ -388,10 +389,10 @@ def main():
         print(f"Error: Cannot create output video {out_path}")
         sys.exit(1)
 
-    print(f"\nDecoding video frames via ffmpeg...")
-    decoded_frames = []
+    print(f"\nStreaming video frames via ffmpeg...")
     last_good = np.zeros((src_h, src_w, 3), dtype=np.uint8)
     frame_nbytes = src_w * src_h * 3
+    stream_done = False
 
     ffmpeg_cmd = [
         "ffmpeg", "-v", "error",
@@ -403,21 +404,28 @@ def main():
     ]
     ff_proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    while len(decoded_frames) < total_frames:
+    def next_frame():
+        """Pull the next decoded frame; repeat the last one once the pipe dries up.
+
+        Frames are consumed one at a time rather than buffered up front: a raw
+        BGR frame is src_w*src_h*3 bytes (~5.9 MiB at 1080p), so holding a whole
+        recording costs tens of GiB — a 6-minute 1080p take needs ~61 GiB and
+        gets the process OOM-killed. The render loop only ever walks forward,
+        so it never needs a frame twice.
+        """
+        nonlocal last_good, stream_done
+        if stream_done:
+            return last_good
         raw = ff_proc.stdout.read(frame_nbytes)
         if len(raw) < frame_nbytes:
-            break
-        vframe = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3)).copy()
-        last_good = vframe
-        decoded_frames.append(vframe)
+            stream_done = True
+            return last_good
+        last_good = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3)).copy()
+        return last_good
 
-    ff_proc.stdout.close()
-    ff_proc.wait()
-
-    while len(decoded_frames) < total_frames:
-        decoded_frames.append(last_good.copy())
-
-    print(f"  Decoded {len(decoded_frames)} frames")
+    # The stream starts at frame 0; walk it up to the first frame we render.
+    for _ in range(start_frame):
+        next_frame()
 
     if start_frame > 0 or end_frame < total_frames:
         print(f"Rendering frames {start_frame}-{end_frame} "
@@ -434,7 +442,7 @@ def main():
             pct = (rendered + 1) / render_count * 100
             print(f"\r  [{pct:5.1f}%] Frame {rendered + 1}/{render_count}", end="", flush=True)
 
-        vframe = decoded_frames[fi]
+        vframe = next_frame()
 
         scale_v = min(VIDEO_W / src_w, OUT_H / src_h)
         new_w = int(src_w * scale_v)
@@ -503,10 +511,19 @@ def main():
                            title_sd, "us", [""], [(100, 220, 255)])
             slot += 1
 
+        if args.watermark:
+            (tw, _), _ = cv2.getTextSize(args.watermark, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            wx, wy = OUT_W - tw - 14, OUT_H - 12
+            cv2.putText(canvas, args.watermark, (wx + 1, wy + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, args.watermark, (wx, wy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
         writer.write(canvas)
 
     writer.release()
-    decoded_frames.clear()
+    if not stream_done:
+        ff_proc.stdout.close()          # stops ffmpeg early when --end trims the tail
+    ff_proc.terminate()                 # never block on an ffmpeg stalled writing stderr
+    ff_proc.wait()
     print(f"\n\nDone! Output: {out_path}")
     print(f"  Duration: {render_count / fps:.1f}s @ {fps:.0f} fps")
 
