@@ -14,8 +14,8 @@ resolution and downscaled, and the reported disparity stays in model pixels
 (fx is scaled to match), so the metric depth is unchanged. On an RTX-class
 GPU expect ~0.3 s/frame (CUDA); CPU works but is ~12x slower.
 
-Model: models/hitnet/hitnet_mb_720x1280.onnx (Middlebury-trained, from the
-PINTO model zoo, input [1,6,H,W] = RGB left + RGB right in 0..1).
+Model: bring your own stereo-disparity ONNX (input [1,6,H,W] = RGB left +
+RGB right in 0..1, disparity out) and pass it with --model.
 
 Usage:
     .venv/bin/python scripts/stereo_depth_neural.py TAKE_PREFIX OUT.mp4 \
@@ -121,9 +121,9 @@ def main():
     ap.add_argument("--calibration", type=Path, default=None,
                     help="calibration.json or TBLC .bin (default: the blob "
                          "embedded in the recording)")
-    ap.add_argument("--model", type=Path,
-                    default=_HERE.parent / "models" / "hitnet"
-                    / "hitnet_mb_720x1280.onnx")
+    ap.add_argument("--model", type=Path, required=True,
+                    help="stereo-disparity ONNX model "
+                         "(input [1,6,H,W] RGB-left+RGB-right in 0..1)")
     ap.add_argument("--cpu", action="store_true",
                     help="force CPUExecutionProvider")
     ap.add_argument("--compare-sgbm", action="store_true",
@@ -170,7 +170,7 @@ def main():
                   f"absorbed into rectification")
 
     net = HitnetMatcher(args.model, use_cpu=args.cpu)
-    print(f"[hitnet] {args.model.name} on {net.provider} "
+    print(f"[stereo-net] {args.model.name} on {net.provider} "
           f"({net.w}x{net.h})")
 
     # Depth math runs at model resolution: scale rectified fx to model width.

@@ -74,12 +74,12 @@ def main():
                     help="skip keyframes rotating faster than this — "
                          "motion-blurred depth integrates as spray (0 = off)")
     ap.add_argument("--neural", action="store_true",
-                    help="HITNet disparity (GPU) instead of SGBM, with a "
+                    help="neural disparity (GPU) instead of SGBM, with a "
                          "left-right consistency check so only cross-"
-                         "validated pixels enter the volume")
-    ap.add_argument("--model", type=Path,
-                    default=Path(__file__).resolve().parent.parent / "models"
-                    / "hitnet" / "hitnet_mb_720x1280.onnx")
+                         "validated pixels enter the volume (needs --model)")
+    ap.add_argument("--model", type=Path, default=None,
+                    help="stereo-disparity ONNX model for --neural "
+                         "(input [1,6,H,W] RGB-left+RGB-right in 0..1)")
     ap.add_argument("--lr-thresh", type=float, default=1.5,
                     help="max |disp_L - disp_R| (px, model scale) for the "
                          "--neural consistency check")

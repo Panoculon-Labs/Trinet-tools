@@ -29,5 +29,5 @@ test-av/
 
 .claude/
 
-# Neural stereo model weights (fetch per models/hitnet/README.md)
+# Neural stereo model weights (local only, never committed)
 models/**/*.onnx
