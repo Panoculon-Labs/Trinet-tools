@@ -106,6 +106,31 @@ print(rec.meta["drops"])                 # camera's own frame-drop summary
 calib = calib_blob.unpack(rec.calib_blob)  # intrinsics/extrinsics/IMU noise
 ```
 
+### Recording shows only ~1 second? Repair it (bulk)
+
+Some recordings play back as only **~1 second long** (or get rejected as
+"corrupt"/truncated) in certain players, web uploaders, or editors — even though
+the full clip is there and plays fine in VLC/QuickTime. This happens when the
+MP4 is written in a *fragmented* layout that naive readers don't fully parse.
+
+`repair_recordings.py` rewrites every affected MP4 in a folder into a standard
+MP4 that plays everywhere. It does **not** re-encode or move the video/audio —
+it just rebuilds the index — so it's fast and lossless, preserves audio, and is
+crash-safe. **No dependencies** (standard-library Python 3 only; no `ffmpeg`).
+
+```bash
+# Fix every .mp4 in a folder (in place):
+python3 scripts/repair_recordings.py /path/to/recordings
+
+# Include subfolders, and keep a .bak of each file you change:
+python3 scripts/repair_recordings.py /path/to/recordings --recursive --backup
+
+# See what would change without touching anything:
+python3 scripts/repair_recordings.py /path/to/recordings --dry-run
+```
+
+Already-standard files are left untouched, and re-running is safe (idempotent).
+
 ### Parse a recording in Python
 
 ```python
@@ -229,6 +254,52 @@ upside-down — common for wrist units — flip its panel with `--rotate180`, e.
 ```bash
 python examples/inspect_recording.py path/to/recording.imu
 ```
+
+## Packaging recordings for delivery
+
+`ingest_sd_card.py` turns an SD card straight into upload-ready ZIPs — one per
+clip — each carrying the video, its inertial sidecars, and a `metadata.json`
+recording where and how the footage was collected. Built for data-collection
+programs that require per-video metadata and enforce quality thresholds.
+
+```bash
+# Windows: card in E:, ZIPs into D:\deliveries
+python scripts\ingest_sd_card.py --drive E: --collector alice01 ^
+    --country US --environment residential/laundry --capture-date 2026-07-20 ^
+    --calibration cal\unit-aa3d26ba.json --out D:\deliveries
+```
+
+```
+alice01_20260720_aa3d26ba_recording3_1.zip
+    recording3_1.{mp4,imu,vts,json}
+    metadata.json     collection details + camera calibration + video/IMU specs
+    README.md         how to read the files
+```
+
+It finds the card by itself (mounting it read-only if the system has not), and
+handles solo recordings and synced multi-camera takes alike. `metadata.json`
+covers the full collection spec: the details you pass on the command line
+(environment, country, collector/session), the device id, the video's technical
+properties (codec, resolution, frame rate, bitrate, GOP, B-frames and colour
+depth — the last three read straight from the H.264 bitstream), and the IMU
+metadata; `--calibration` folds in the intrinsics and extrinsics, with a
+properly computed fisheye field of view.
+
+More flags for delivery prep: `--mcap` emits a Foxglove-ready
+[MCAP](https://mcap.dev) per clip (IMU + video on one timeline); `--reencode`
+transcodes to a compliant ≤8 Mbps H.264 (via ffmpeg, hardware-accelerated when
+available); `--gate` skips clips that would be refused (too short, no IMU,
+truncated video). A companion `scripts/backfill_metadata.py` adds missing
+metadata fields to already-delivered ZIPs in place.
+
+**The card is only ever read from**, and by default the MP4 index is rebuilt
+(lossless) so strict uploaders accept the file (`--no-repair` to copy verbatim).
+**Standard-library Python 3 only** — the sole exception is `--reencode`, which
+needs `ffmpeg`.
+
+Full guide, including the metadata field mapping, batch-vs-device calibration,
+MCAP output and how the card is found and mounted:
+[`docs/data_collection_packaging.md`](docs/data_collection_packaging.md).
 
 ## Stereo recordings: depth, motion HUD, and SLAM
 
