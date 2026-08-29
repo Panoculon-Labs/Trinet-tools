@@ -57,12 +57,19 @@ VTS_ENTRY_SIZE_V2 = 24
 # v4: appends exposure_us(uint32) + entry_flags(uint32) + readout_time_us(uint32).
 # sof_timestamp_ns is the mid-exposure frame time when TIMING_MID_EXPOSURE is set
 # (else raw start-of-frame); when TIMING_FRAME_CENTERED is also set it references the
+TIMING_PHASE_UNLOCKED = 0x10  # cross-camera frame-phase servo had not converged at this frame
 # MIDDLE row of the rolling shutter (the frame's temporal centre), else the TOP row.
 # readout_time_us = rolling-shutter readout span (µs, first row → last row); per-row
 # delay = readout_time_us / image_height (the Kalibr line_delay). For per-row times
 # use VtsData.row_offset_s(), which branches on TIMING_FRAME_CENTERED.
 VTS_ENTRY_FMT_V4 = "<IQIQIII"
 VTS_ENTRY_SIZE_V4 = 36
+
+# v5 = 44-byte entry: the v4 fields + per-frame master_clock_offset_ns (int64).
+# NEVER parse a v5 file with the v4 entry size — every entry after the first
+# comes out misaligned garbage.
+VTS_ENTRY_FMT_V5 = "<IQIQIIIq"
+VTS_ENTRY_SIZE_V5 = 44
 TIMING_MID_EXPOSURE = 0x01    # frame timestamp is exposure-center (else start-of-frame)
 TIMING_EXPOSURE_VALID = 0x02  # exposure_us is valid
 TIMING_READOUT_VALID = 0x04   # readout_time_us is valid
@@ -228,6 +235,7 @@ class VtsData:
     exposure_us: Optional[np.ndarray] = None        # (M,) uint32 (v4+; 0 if unknown)
     timing_flags: Optional[np.ndarray] = None       # (M,) uint32 (v4+; TIMING_*)
     readout_time_us: Optional[np.ndarray] = None     # (M,) uint32 (v4+; rolling-shutter span µs)
+    frame_offset_ns: Optional[np.ndarray] = None     # (M,) int64  (v5+; live local->master offset AT that frame)
 
     @property
     def is_mid_exposure(self) -> bool:
@@ -252,6 +260,25 @@ class VtsData:
         if self.timing_flags is None or len(self.timing_flags) == 0:
             return False
         return bool(int(self.timing_flags[0]) & TIMING_FRAME_CENTERED)
+
+    @property
+    def phase_locked_mask(self) -> np.ndarray:
+        """Boolean mask of frames whose cross-camera phase servo had converged.
+
+        ``False`` marks the acquisition transient at the start of a synced slave
+        take, where cross-camera error can reach a full frame period. Exclude
+        those frames before quoting any sync statistic::
+
+            m = vts.phase_locked_mask
+            good = vts.global_sof_ns()[m]
+
+        All-``True`` on solo takes, on the group master, and on firmware that
+        predates the flag — in the last case absence of the flag is not
+        evidence the servo had locked.
+        """
+        if self.timing_flags is None or len(self.timing_flags) == 0:
+            return np.ones(0, dtype=bool)
+        return (self.timing_flags.astype(np.uint32) & TIMING_PHASE_UNLOCKED) == 0
 
     def line_delay_s(self, image_height: int) -> Optional[float]:
         """Per-row readout delay in seconds (the Kalibr ``line_delay``), or None
@@ -325,7 +352,12 @@ class VtsData:
         Returns int64 nanoseconds.
         """
         sof = self.best_timestamps_ns.astype(np.int64)
-        if not self.header.synced or sof.size == 0:
+        if sof.size == 0:
+            return sof
+        # v5 carries the live offset at each frame — exact, no extrapolation.
+        if self.frame_offset_ns is not None and len(self.frame_offset_ns):
+            return sof + self.frame_offset_ns.astype(np.int64)
+        if not self.header.synced:
             return sof
         off = np.int64(self.header.master_clock_offset_ns)
         skew = np.int64(self.header.clock_skew_ppb)
@@ -484,7 +516,16 @@ def read_vts(path: str) -> VtsData:
 
     if header.version >= 4:
         # v4 = 36-byte entry: v2 fields + exposure_us + entry_flags + readout_time_us.
-        num_entries = len(data) // VTS_ENTRY_SIZE_V4
+        # v5 = 44-byte entry: the above + per-frame master_clock_offset_ns.
+        _v5 = header.version >= 5
+        _fmt = VTS_ENTRY_FMT_V5 if _v5 else VTS_ENTRY_FMT_V4
+        _sz = VTS_ENTRY_SIZE_V5 if _v5 else VTS_ENTRY_SIZE_V4
+        if len(data) % _sz:
+            raise ValueError(
+                f"{path}: {len(data)} entry bytes is not a multiple of {_sz} "
+                f"for .vts v{header.version} — refusing to guess the layout")
+        num_entries = len(data) // _sz
+        frame_offset_ns = np.zeros(num_entries, dtype=np.int64)
         frame_numbers = np.zeros(num_entries, dtype=np.uint32)
         sof_ts = np.zeros(num_entries, dtype=np.uint64)
         venc_seq = np.zeros(num_entries, dtype=np.uint32)
@@ -494,9 +535,13 @@ def read_vts(path: str) -> VtsData:
         readout_us = np.zeros(num_entries, dtype=np.uint32)
 
         for i in range(num_entries):
-            offset = i * VTS_ENTRY_SIZE_V4
-            fn, sof, seq, pts, exp, fl, ro = struct.unpack(
-                VTS_ENTRY_FMT_V4, data[offset:offset + VTS_ENTRY_SIZE_V4])
+            offset = i * _sz
+            vals = struct.unpack(_fmt, data[offset:offset + _sz])
+            if _v5:
+                fn, sof, seq, pts, exp, fl, ro, foff = vals
+                frame_offset_ns[i] = foff
+            else:
+                fn, sof, seq, pts, exp, fl, ro = vals
             frame_numbers[i] = fn
             sof_ts[i] = sof
             venc_seq[i] = seq
@@ -519,6 +564,7 @@ def read_vts(path: str) -> VtsData:
             exposure_us=exposure_us,
             timing_flags=timing_flags,
             readout_time_us=readout_us,
+            frame_offset_ns=(frame_offset_ns if _v5 else None),
         )
 
     if header.version >= 2:

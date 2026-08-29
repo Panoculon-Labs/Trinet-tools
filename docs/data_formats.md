@@ -192,6 +192,7 @@ monotonic clock that timestamps the IMU samples.
 | 2       | 24 bytes   | + `venc_seq` + `venc_pts_us` (ties each frame to its encoded packet)                               |
 | 3       | 24 bytes   | per-frame entry unchanged from v2; the header's 16 reserved bytes now carry a multi-camera clock-sync block (below). v2 readers ignore those bytes and parse v3 entries unchanged. |
 | 4       | 36 bytes   | + `exposure_us` + `entry_flags` + `readout_time_us`. `sof_timestamp_ns` becomes the **mid-exposure** frame time when `entry_flags` bit 0 (`MID_EXPOSURE`) is set (else start-of-frame); bit 3 (`FRAME_CENTERED`) marks it as referencing the **middle** row of the rolling shutter (the frame's temporal centre) vs the **top** row when clear. `readout_time_us` is the rolling-shutter readout span; per-row delay = `readout_time_us / image_height` = the Kalibr `line_delay` (use the `FRAME_CENTERED`-selected reference row for per-row times). Written by mid-exposure (SEI v6) cameras. |
+| 5       | 44 bytes   | + `master_clock_offset_ns` (int64): the live local→master clock offset **at that frame**, written by group-synced (multi-camera) firmware. `global_time = sof_timestamp_ns + master_clock_offset_ns`, exact per frame — no drift extrapolation needed. Adds `entry_flags` bit 4 `PHASE_UNLOCKED` (the cross-camera frame-phase servo had not yet converged at this frame; exclude flagged frames from sync statistics). |
 
 ### Header (32 bytes)
 
@@ -212,10 +213,12 @@ at recording start when the unit is part of a wireless-synced multi-camera group
 | 28     | 2    | uint16 | sync_quality_us        | estimated 1-sigma sync error (µs)                                |
 | 30     | 2    | uint16 | sync_flags             | bit 0 = synced (offset valid); bit 1 = this unit is the group master; bit 2 = sync link was down when stamped |
 
+On v5 files the per-frame `master_clock_offset_ns` in each entry supersedes
+this header-level value (which reflects the offset at recording start only).
 For a solo (un-synced) recording these bytes are zero and `sof_timestamp_ns` is
 already the correct per-camera clock.
 
-### Entry (12 bytes in v1; 24 bytes in v2/v3; 36 bytes in v4, one per encoded video frame)
+### Entry (12 bytes in v1; 24 bytes in v2/v3; 36 bytes in v4; 44 bytes in v5 — one per encoded video frame)
 
 | offset | size | type     | field             | meaning                                                |
 | ------ | ---- | -------- | ----------------- | ------------------------------------------------------ |
@@ -224,8 +227,9 @@ already the correct per-camera clock.
 | 12     | 4    | uint32   | venc_seq          | encoder-internal sequence number (v2+)                 |
 | 16     | 8    | uint64   | venc_pts_us       | encoder presentation timestamp in microseconds (v2+). **Delivery timeline — do not use for IMU sync.** |
 | 24     | 4    | uint32   | exposure_us       | v4: applied integration time (valid when `entry_flags` bit 1) |
-| 28     | 4    | uint32   | entry_flags       | v4: bit 0 = `MID_EXPOSURE` (sof is exposure-centred in time), bit 1 = `EXPOSURE_VALID`, bit 2 = `READOUT_VALID`, **bit 3 = `FRAME_CENTERED`** (sof references the **middle** row of the rolling shutter — the frame's temporal centre, `SOF − T_exp/2 + T_readout/2`; when clear but MID_EXPOSURE set, it references the **top** row, `SOF − T_exp/2`) |
+| 28     | 4    | uint32   | entry_flags       | v4: bit 0 = `MID_EXPOSURE` (sof is exposure-centred in time), bit 1 = `EXPOSURE_VALID`, bit 2 = `READOUT_VALID`, **bit 3 = `FRAME_CENTERED`** (sof references the **middle** row of the rolling shutter — the frame's temporal centre, `SOF − T_exp/2 + T_readout/2`; when clear but MID_EXPOSURE set, it references the **top** row, `SOF − T_exp/2`), v5: bit 4 = `PHASE_UNLOCKED` (frame-phase servo not converged — exclude from sync statistics) |
 | 32     | 4    | uint32   | readout_time_us   | v4: rolling-shutter readout span µs (valid when `entry_flags` bit 2); per-row delay = `readout_time_us / image_height` (Kalibr `line_delay`) |
+| 36     | 8    | int64    | master_clock_offset_ns | v5: live local→master offset at this frame; `global = sof_timestamp_ns + this`. Supersedes the header-level offset + skew extrapolation for synced takes. |
 
 v1 entries stop after `sof_timestamp_ns` (12 bytes); `venc_seq`/`venc_pts_us`
 were added in v2.
