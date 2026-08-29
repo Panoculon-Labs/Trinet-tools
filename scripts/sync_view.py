@@ -445,7 +445,13 @@ def render(cams, args):
             gts.append(T + resid_ns)
         ref = gts[master_idx]                         # group master = reference
         cross_ms = [(g - ref) / 1e6 for g in gts]
-        spread_ms = (max(gts) - min(gts)) / 1e6       # true cross-camera simultaneity error
+        # NOTE ON WHAT THIS IS: the spread of the shown frames' CORRECTED global
+        # times. Both cameras are corrected with the same clock offset, so an
+        # error in that offset moves the comparison and the correction together
+        # -- this number cannot see it. It shows frame-grid quantisation and
+        # residual tracking error, not true simultaneity. Measuring the real
+        # thing needs an out-of-loop reference (an LED both cameras watch).
+        spread_ms = (max(gts) - min(gts)) / 1e6
 
         x = 0
         for ci, c in enumerate(cams):
@@ -476,12 +482,15 @@ def render(cams, args):
                             "gyro xyz", "rad/s", gyr_span)
             x += pw + PANEL_GAP
 
-        # header: elapsed global time + TRUE cross-camera offset (vs master),
+        # header: elapsed global time + the shown frames' spread (vs master),
         # NOT the distance-to-playback-grid (which beats with the capture rate).
+        # "self-rep" is the device's OWN estimate of its sync quality, which is
+        # derived from the same clock exchange it is reporting on -- a sanity
+        # indicator, not an independent measurement.
         cv2.rectangle(canvas, (0, 0), (total_w, HEADER_H), (40, 40, 40), -1)
         _put(canvas, f"t = {(T - t0)/1e9:8.3f} s   (master clock)", (8, 23), 0.6, FG)
         q = max((c.quality_us for c in cams), default=0)
-        _put(canvas, f"sync ~{q} us  |  cross-cam {spread_ms:+5.2f} ms",
+        _put(canvas, f"self-rep ~{q} us  |  frame spread {spread_ms:+5.2f} ms",
              (total_w - 360, 23), 0.5, ACCENT if spread_ms < 2.0 else WARN)
 
         if args.show:
@@ -612,7 +621,7 @@ def main():
     print("\nCameras:")
     for c in cams:
         if c.synced:
-            print(f"  {c.label:24s} synced, ~{c.quality_us} us, "
+            print(f"  {c.label:24s} synced, self-reported ~{c.quality_us} us, "
                   f"{len(c.global_ns)} frames")
         else:
             print(f"  {c.label:24s} NOT synced (no v3 offset) — aligning by raw "
