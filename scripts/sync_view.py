@@ -607,9 +607,6 @@ def main():
                          "(e.g. inverted-mounted wrist cams): --rotate180 0,2")
     ap.add_argument("--watermark", default="", help="watermark text (bottom-right of the video area)")
     ap.add_argument("--show", action="store_true", help="live preview instead of writing a file")
-    ap.add_argument("--rotate180", default="",
-                    help="comma list of 0-based panel indices whose video to rotate 180 "
-                         "(e.g. inverted-mounted wrist cams): --rotate180 0,2")
     ap.add_argument("--imu", action="store_true",
                     help="draw each camera's accel/gyro under its panel, on the "
                          "same shared clock (reads the .imu sidecars)")
