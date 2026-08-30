@@ -39,14 +39,32 @@ def _madgwick_loop(
     q_out = np.zeros((n, 4), dtype=np.float64)
     madgwick = Madgwick(frequency=float(max(mean_hz, 1.0)))
 
+    # The magnetometer updates slower than the IMU sample rate, so the first
+    # sample(s) of a recording — and any sample inside a mag gap — can carry
+    # mag = [0, 0, 0]. Normalising a zero vector poisons the whole filter
+    # with NaNs (every downstream quaternion becomes zero-norm and SciPy's
+    # Rotation.from_quat raises). Treat zero-norm mag as "no mag for this
+    # sample": accel-only init, gyro+accel update.
+    MAG_MIN_UT = 1.0
+
     if mag is not None:
-        q_out[0] = ecompass(acc[0], mag[0], frame="NED", representation="quaternion")
+        mag_ok = np.linalg.norm(mag, axis=1) >= MAG_MIN_UT
+        if mag_ok[0]:
+            q_out[0] = ecompass(acc[0], mag[0], frame="NED",
+                                representation="quaternion")
+        else:
+            q_out[0] = acc2q(acc[0])
         for t in range(1, n):
             d = float(dt[t - 1])
             if d <= 0.0 or d > 0.5 or not np.isfinite(d):
                 q_out[t] = q_out[t - 1]
                 continue
-            q_out[t] = madgwick.updateMARG(q_out[t - 1], gyr[t], acc[t], mag[t], dt=d)
+            if mag_ok[t]:
+                q_out[t] = madgwick.updateMARG(q_out[t - 1], gyr[t], acc[t],
+                                               mag[t], dt=d)
+            else:
+                q_out[t] = madgwick.updateIMU(q_out[t - 1], gyr[t], acc[t],
+                                              dt=d)
     else:
         q_out[0] = acc2q(acc[0])
         for t in range(1, n):
