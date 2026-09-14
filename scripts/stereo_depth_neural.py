@@ -87,7 +87,16 @@ def _preload_cuda_libs() -> None:
 
 
 class HitnetMatcher:
-    """HITNet ONNX stereo matcher. Returns disparity in MODEL pixels."""
+    """ONNX stereo matcher. Returns disparity in MODEL pixels.
+
+    Two input contracts are recognised from the graph itself:
+      * HITNet style — ONE input [1,6,H,W]: RGB left + RGB right, 0..1.
+      * Lite Any Stereo style (LAS1/LAS2 `export_onnx.py`) — TWO inputs
+        `left`/`right` [1,3,H,W], RGB in 0..255 (the model normalises
+        internally), output `disparity` [1,1,H,W].
+    Either way the caller hands in rectified BGR frames at any size and gets
+    a disparity map at the model's fixed resolution.
+    """
 
     def __init__(self, model_path: Path, use_cpu: bool = False):
         _preload_cuda_libs()
@@ -96,20 +105,38 @@ class HitnetMatcher:
                      else ["CUDAExecutionProvider", "CPUExecutionProvider"])
         self.sess = ort.InferenceSession(str(model_path), providers=providers)
         self.provider = self.sess.get_providers()[0]
-        inp = self.sess.get_inputs()[0]
-        self.name = inp.name
-        _, c, self.h, self.w = inp.shape
-        if c != 6:
-            raise ValueError(f"expected a 6-channel HITNet model, got {c}ch")
+        inputs = self.sess.get_inputs()
+        if len(inputs) == 1:
+            inp = inputs[0]
+            self.names = [inp.name]
+            _, c, self.h, self.w = inp.shape
+            if c != 6:
+                raise ValueError(f"expected a 6-channel HITNet model, got {c}ch")
+            self.kind = "hitnet"
+        elif len(inputs) == 2:
+            self.names = [i.name for i in inputs]
+            _, c, self.h, self.w = inputs[0].shape
+            if c != 3:
+                raise ValueError(f"expected two 3-channel inputs, got {c}ch")
+            self.kind = "las"
+        else:
+            raise ValueError(f"unsupported model: {len(inputs)} inputs")
+        self.label = "LiteAnyStereo" if self.kind == "las" else "HITNet"
 
     def __call__(self, bgr_l: np.ndarray, bgr_r: np.ndarray) -> np.ndarray:
         """bgr_l/bgr_r: rectified uint8 BGR at any size -> disparity (h, w)."""
+        scale = 255.0 if self.kind == "hitnet" else 1.0
+
         def prep(img):
             img = cv2.resize(img, (self.w, self.h))
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / scale
             return rgb.transpose(2, 0, 1)
-        x = np.concatenate([prep(bgr_l), prep(bgr_r)])[None]
-        out = self.sess.run(None, {self.name: x})[0]
+        if self.kind == "hitnet":
+            x = np.concatenate([prep(bgr_l), prep(bgr_r)])[None]
+            out = self.sess.run(None, {self.names[0]: x})[0]
+        else:
+            out = self.sess.run(None, {self.names[0]: prep(bgr_l)[None],
+                                       self.names[1]: prep(bgr_r)[None]})[0]
         return out.reshape(self.h, self.w)
 
 
@@ -234,7 +261,7 @@ def main():
         t0 = time.time()
         disp = net(rl, rr)
         times.append(time.time() - t0)
-        panels = [(color_net(disp), "HITNet depth")]
+        panels = [(color_net(disp), f"{net.label} depth")]
         if sgbm is not None:
             gl = cv2.cvtColor(rl, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(rr, cv2.COLOR_BGR2GRAY)
@@ -260,7 +287,7 @@ def main():
         c.release()
     ff.stdin.close()
     ff.wait()
-    print(f"wrote {args.out}: {n} frames, HITNet "
+    print(f"wrote {args.out}: {n} frames, {net.label} "
           f"{np.median(times)*1000:.0f} ms/frame median on {net.provider}")
 
 
