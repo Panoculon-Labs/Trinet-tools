@@ -203,7 +203,8 @@ def main():
     # Depth math runs at model resolution: scale rectified fx to model width.
     fx_model = rect.fx * (net.w / rect.size[0])
     baseline = rect.baseline_m
-    print(f"baseline {baseline*1000:.1f} mm, fx(model) {fx_model:.1f} px")
+    print(f"baseline {baseline*1000:.1f} mm, fx(model) {fx_model:.1f} px, "
+          f"rectified projection: {getattr(rect, 'projection', 'opencv')}")
 
     sgbm = wls = matcher_r = None
     if args.compare_sgbm or args.compare_wls:

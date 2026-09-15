@@ -52,6 +52,28 @@ class Rectification:
         self.R1, self.R2, self.P1, self.P2, _ = cv2.fisheye.stereoRectify(
             K0, D0, K1, D1, size, T10[:3, :3], T10[:3, 3],
             flags=cv2.CALIB_ZERO_DISPARITY, balance=0.0, fov_scale=1.0)
+        self.projection = "opencv"
+        if not np.isfinite(self.P1[0, 0]) or self.P1[0, 0] < 1.0:
+            # OpenCV sizes the rectified focal from the undistorted image
+            # boundary. On a lens that follows the ideal equidistant fisheye
+            # curve closely (the global-shutter head: k1 ~ 0.03 vs ~0.15 on
+            # the fleet lens, fx ~ 624 at 1920x1080 — still a strongly curved
+            # fisheye, just with little polynomial correction on top) the
+            # frame corners lie beyond 90 deg off-axis, those boundary points
+            # blow up, and stereoRectify returns fx = 0 — every pixel maps to
+            # one point. The rotations R1/R2 come from T only and stay valid, so
+            # build the pinhole projection ourselves: a fixed 0.85x of the
+            # mean fisheye focal (the ratio OpenCV picks on the fleet lens),
+            # principal point at the frame centre, ZERO_DISPARITY baseline.
+            f = 0.85 * 0.5 * (float(K0[0, 0]) + float(K1[0, 0]))
+            b = float(np.linalg.norm(T10[:3, 3]))
+            P = np.array([[f, 0.0, size[0] / 2.0, 0.0],
+                          [0.0, f, size[1] / 2.0, 0.0],
+                          [0.0, 0.0, 1.0, 0.0]])
+            self.P1 = P
+            self.P2 = P.copy()
+            self.P2[0, 3] = -f * b
+            self.projection = f"manual pinhole f={f:.1f}"
         self.map_l = cv2.fisheye.initUndistortRectifyMap(
             K0, D0, self.R1, self.P1, size, cv2.CV_16SC2)
         self.map_r = cv2.fisheye.initUndistortRectifyMap(
