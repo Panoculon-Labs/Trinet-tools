@@ -20,6 +20,14 @@ Transport note: firmware >= 0.3.1 streams over USB *bulk* rather than
 isochronous. Linux uvcvideo handles bulk natively — nothing special is needed
 here — but see --list if the camera is not picked up automatically.
 
+Stereo cameras (Trinet Pro Stereo, rolling shutter v5, and Pro Stereo GS,
+global shutter v6) carry both eyes in one side-by-side 3840x1080 frame on the
+same USB function and PID as the mono camera. The frame size is therefore
+read from what the camera advertises, widest first, exactly as the Android
+SDK does. It is never assumed. meta.json then records video.layout = "sbs"
+(left half = physically left eye) and video.shutter = "global" | "rolling",
+matching the SDK's keys.
+
 Usage:
     python3 scripts/record_uvc.py                    # auto-detect, until Ctrl-C
     python3 scripts/record_uvc.py -d 60              # fixed 60 s
@@ -44,9 +52,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trinet_tools.extract_sei import extract  # noqa: E402
+from trinet_tools.reader import read_vts  # noqa: E402
 
 USB_VID, USB_PID = 0x2207, 0x0016
-DEFAULT_W, DEFAULT_H, DEFAULT_FPS = 1920, 1080, 30
+DEFAULT_FPS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +96,49 @@ def _does_h264_capture(node: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return "H264" in out.upper()
+
+
+def h264_sizes(formats_ext: str) -> list[tuple[int, int]]:
+    """Frame sizes listed under the H264 format in `v4l2-ctl --list-formats-ext`
+    output, widest first.
+
+    Only the H264 section counts. The stereo camera advertises MJPEG *first* at
+    the same size, and MJPEG carries no SEI (so no IMU), so it must never be
+    what we pick a size from by accident.
+    """
+    sizes, in_h264 = [], False
+    for line in formats_ext.splitlines():
+        fmt = re.search(r"\[\d+\]:\s*'(\w+)'", line)
+        if fmt:
+            in_h264 = fmt.group(1).upper() == "H264"
+            continue
+        m = re.search(r"Size:\s*Discrete\s+(\d+)x(\d+)", line)
+        if in_h264 and m:
+            wh = (int(m.group(1)), int(m.group(2)))
+            if wh not in sizes:
+                sizes.append(wh)
+    return sorted(sizes, key=lambda wh: (wh[0] * wh[1], wh[0]), reverse=True)
+
+
+def advertised_h264_size(node: str):
+    """(w, h) the camera advertises for H.264, widest first; None if unreadable."""
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", node, "--list-formats-ext"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sizes = h264_sizes(out)
+    return sizes[0] if sizes else None
+
+
+def layout_of(width: int, height: int):
+    """"sbs" for a side-by-side stereo frame, else None (mono omits the key).
+
+    Same rule as the SDK's StreamLayout.of: a stereo pair is 2:1 wider than a
+    mono frame of the same height, so >= 3:1 separates it from every single-eye
+    format with room to spare, 21:9 crops included.
+    """
+    return "sbs" if height > 0 and width >= height * 3 else None
 
 
 def find_trinet_nodes() -> list[tuple[str, str]]:
@@ -135,6 +187,27 @@ def record(node: str, dst: Path, width: int, height: int, fps: int,
             proc.kill()
 
 
+def shutter_of(frames_bin: Path):
+    """"global" / "rolling" from the recording's own frame timing, else None.
+
+    Uses the reader's VtsData.is_global_shutter / is_rolling_shutter, the same
+    rule the SDK writes. It comes from the stream, not the camera's generation,
+    because an unprovisioned unit reports none. Older firmware declares neither,
+    and the key is then omitted.
+    """
+    if not frames_bin.exists():
+        return None
+    try:
+        vts = read_vts(str(frames_bin))
+    except Exception:  # a malformed sidecar must not fail an otherwise good take
+        return None
+    if vts.is_global_shutter:
+        return "global"
+    if vts.is_rolling_shutter:
+        return "rolling"
+    return None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -143,8 +216,10 @@ def main(argv=None) -> int:
     ap.add_argument("-d", "--duration", type=int, default=0,
                     help="seconds to record (0 = until Ctrl-C)")
     ap.add_argument("--device", help="video node, e.g. /dev/video0 (default: auto-detect)")
-    ap.add_argument("--width", type=int, default=DEFAULT_W)
-    ap.add_argument("--height", type=int, default=DEFAULT_H)
+    ap.add_argument("--width", type=int, default=0,
+                    help="frame width (default: widest H.264 size the camera advertises)")
+    ap.add_argument("--height", type=int, default=0,
+                    help="frame height (default: from the advertised H.264 size)")
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS)
     ap.add_argument("--list", action="store_true", help="list Trinet nodes and exit")
     args = ap.parse_args(argv)
@@ -172,6 +247,12 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
+    if args.width and args.height:
+        width, height = args.width, args.height
+    else:
+        width, height = advertised_h264_size(node) or (1920, 1080)
+    layout = layout_of(width, height)
+
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     dev8 = (serial or "")[:8]
     folder_id = f"{dev8}_recording_{ts}" if dev8 else f"recording_{ts}"
@@ -179,7 +260,7 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     raw_mp4 = out_dir / "_capture.mp4"
-    record(node, raw_mp4, args.width, args.height, args.fps, args.duration)
+    record(node, raw_mp4, width, height, args.fps, args.duration)
 
     if not raw_mp4.exists() or raw_mp4.stat().st_size == 0:
         print("error: capture produced no data.\n"
@@ -191,13 +272,18 @@ def main(argv=None) -> int:
     # SEI -> sidecars. Writes video.mp4 / imu.bin / frames.bin into out_dir.
     extract(raw_mp4, out_dir)
 
+    video = {"width": width, "height": height, "fps": args.fps, "codec": "h264"}
+    if layout:
+        video["layout"] = layout
+    shutter = shutter_of(out_dir / "frames.bin")
+    if shutter:
+        video["shutter"] = shutter
     (out_dir / "meta.json").write_text(json.dumps({
         "id": folder_id,
         "created_at_epoch_ms": int(time.time() * 1000),
         "device": {"vendor_id": USB_VID, "product_id": USB_PID,
                    "serial": serial or None},
-        "video": {"width": args.width, "height": args.height,
-                  "fps": args.fps, "codec": "h264"},
+        "video": video,
         "source": "trinet-tools/record_uvc.py",
     }, indent=2))
 
