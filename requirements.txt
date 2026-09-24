@@ -3,3 +3,5 @@ opencv-python>=4.5
 scipy>=1.7
 matplotlib>=3.4
 ahrs>=0.3
+mcap>=1.1
+mcap-ros2-support>=0.5
