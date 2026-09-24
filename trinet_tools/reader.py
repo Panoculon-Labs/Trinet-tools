@@ -262,6 +262,41 @@ class VtsData:
         return bool(int(self.timing_flags[0]) & TIMING_FRAME_CENTERED)
 
     @property
+    def is_global_shutter(self) -> bool:
+        """True if the frames came from a GLOBAL-shutter camera (e.g. Trinet Pro
+        Stereo GS).
+
+        A global-shutter recording declares its readout time as a *valid* zero:
+        ``TIMING_READOUT_VALID`` is set while every ``readout_time_us`` is 0.
+        That is the physical truth for a global shutter (all rows integrate
+        together, so there is no per-row skew) and it distinguishes the case
+        from "readout unknown", where the flag is clear.
+
+        Practical consequences, which the existing helpers already get right:
+        :meth:`line_delay_s` returns None (no rolling-shutter line delay exists
+        to report) and :meth:`row_offset_s` returns 0.0 for every row, so
+        ``sof_timestamps_ns`` alone is the exact exposure centre of the whole
+        frame.
+
+        A global-shutter camera's calibrated ``timeshift_cam_imu`` is NOT
+        interchangeable with a rolling-shutter camera's: the rolling-shutter
+        stamp folds in a constant +T_readout/2. Calibrate each camera type.
+        """
+        if self.timing_flags is None or len(self.timing_flags) == 0:
+            return False
+        if not (int(self.timing_flags[0]) & TIMING_READOUT_VALID):
+            return False
+        if self.readout_time_us is None or len(self.readout_time_us) == 0:
+            return False
+        return bool(np.all(self.readout_time_us == 0))
+
+    @property
+    def is_rolling_shutter(self) -> bool:
+        """True if the recording carries a non-zero rolling-shutter readout
+        time (per-row timing via :meth:`row_offset_s`)."""
+        return bool(self.readout_time_us is not None and np.any(self.readout_time_us > 0))
+
+    @property
     def phase_locked_mask(self) -> np.ndarray:
         """Boolean mask of frames whose cross-camera phase servo had converged.
 

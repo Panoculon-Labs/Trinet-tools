@@ -14,6 +14,7 @@ This repository gives you everything you need to:
   recording.
 - **Visualize** a single recording as a synchronized video + inertial-plot
   composite for sanity checking and demos.
+- **Export** a recording to MCAP for Foxglove and ROS 2 tooling.
 - **Combine** several cameras from the same take into one synced, side-by-side
   video — optionally with a per-camera orientation gizmo — so a multi-camera rig
   (e.g. a head plus two wrist cameras) plays back on a single shared timeline.
@@ -249,6 +250,19 @@ camera is auto-detected and shown as the `ref` panel. If a camera is mounted
 upside-down — common for wrist units — flip its panel with `--rotate180`, e.g.
 `--rotate180 0,2` for the first and third panels.
 
+### Export to MCAP (Foxglove / ROS 2)
+
+Convert any recording (single camera or stereo, global or rolling shutter,
+H.264 or H.265) into one `.mcap` file with video, IMU, magnetometer,
+calibration and per-frame timing:
+
+```bash
+python scripts/to_mcap.py /data/take0004_L.mp4      # stereo take -> take0004.mcap
+```
+
+Video frames are copied, not re-encoded. Topics, timestamps and rolling-shutter
+row timing: [docs/mcap_export.md](docs/mcap_export.md).
+
 ### Inspect a recording from the shell (no plots, just numbers)
 
 ```bash
@@ -361,6 +375,15 @@ These tools work with both **current and pre-v4 Trinet recordings**. The v4
 firmware added a `device_id` field to the `.imu` header's reserved bytes; the
 reader gracefully reports `device_id_hex == ""` for older recordings and is
 otherwise format-identical.
+
+**Trinet Pro Stereo GS** (global shutter) recordings use the same file set
+as the rolling-shutter stereo camera (`<take>_L.mp4`, `<take>_R.mp4`, per-eye
+`.vts`, one `.imu`) and read with the same code. The difference is timing: a
+global-shutter `.vts` reports `readout_time_us = 0` as a valid value, so every
+row shares the frame timestamp (`VtsData.is_global_shutter` is `True` and
+`row_offset_s()` is 0). Its camera-IMU calibration is not interchangeable with
+a rolling-shutter camera's; see
+[docs/imu_video_sync.md](docs/imu_video_sync.md#global-shutter-cameras-trinet-pro-stereo-gs).
 
 If you have a recording with a different magic string or version that this
 library doesn't recognize, please file an issue — we'll add support.
