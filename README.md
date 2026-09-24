@@ -376,6 +376,15 @@ firmware added a `device_id` field to the `.imu` header's reserved bytes; the
 reader gracefully reports `device_id_hex == ""` for older recordings and is
 otherwise format-identical.
 
+**Trinet Pro Stereo GS** (global shutter) recordings use the same file set
+as the rolling-shutter stereo camera (`<take>_L.mp4`, `<take>_R.mp4`, per-eye
+`.vts`, one `.imu`) and read with the same code. The difference is timing: a
+global-shutter `.vts` reports `readout_time_us = 0` as a valid value, so every
+row shares the frame timestamp (`VtsData.is_global_shutter` is `True` and
+`row_offset_s()` is 0). Its camera-IMU calibration is not interchangeable with
+a rolling-shutter camera's; see
+[docs/imu_video_sync.md](docs/imu_video_sync.md#global-shutter-cameras-trinet-pro-stereo-gs).
+
 If you have a recording with a different magic string or version that this
 library doesn't recognize, please file an issue — we'll add support.
 

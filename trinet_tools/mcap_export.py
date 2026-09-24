@@ -47,8 +47,7 @@ from typing import Iterator, List, Optional, Tuple
 import numpy as np
 
 from . import calib_blob
-from .reader import (TIMING_FRAME_CENTERED, TIMING_PHASE_UNLOCKED,
-                     TIMING_READOUT_VALID, ImuData, VtsData, read_imu,
+from .reader import (TIMING_FRAME_CENTERED, TIMING_PHASE_UNLOCKED, ImuData, VtsData, read_imu,
                      read_vts)
 from .tmf import read_tmf
 
@@ -374,9 +373,9 @@ def shutter_info(vts: VtsData) -> Tuple[str, int, bool]:
     flags = int(vts.timing_flags[0]) if vts.timing_flags is not None and len(vts.timing_flags) else 0
     ro = vts.readout_time_us
     readout = int(np.median(ro[ro > 0])) if ro is not None and np.any(ro > 0) else 0
-    if readout > 0:
+    if vts.is_rolling_shutter:
         return "rolling", readout, bool(flags & TIMING_FRAME_CENTERED)
-    if flags & TIMING_READOUT_VALID:
+    if vts.is_global_shutter:
         return "global", 0, False
     return "unknown", 0, False
 

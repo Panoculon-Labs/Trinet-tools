@@ -225,10 +225,31 @@ the `(r − r_ref)·line_delay` term with the correct branch. Most consumers can
 all of this and treat the frame as captured at `sof + timeshift`; VIO front-ends that
 model the rolling shutter should use `line_delay` with the flag-selected `r_ref`.
 
+### Global-shutter cameras (Trinet Pro Stereo GS)
+
+A global-shutter camera exposes every row at the same instant, so none of the
+per-row maths above applies. Its `.vts` says so explicitly: `READOUT_VALID` is set
+and `readout_time_us` is `0` on every frame (a *valid* zero, as opposed to "unknown",
+where the flag is clear). `sof_timestamp_ns` is then the exposure centre of the whole
+frame.
+
+```python
+vts = read_vts("take0004_L.vts")
+vts.is_global_shutter      # True
+vts.row_offset_s(0, 1080)  # 0.0 for every row
+vts.line_delay_s(1080)     # None: there is no line delay
+```
+
+Because a rolling-shutter stamp folds in `readout/2` and a global-shutter stamp does
+not, the calibrated `timeshift_cam_imu` differs between the two camera types (a few
+milliseconds on the Stereo GS sample, versus about −15 ms on rolling-shutter units).
+**Use the calibration that came with the camera; never reuse one camera type's
+calibration for the other.**
+
 ## Summary
 
 | Layer | Source | Removes | Result |
 |-------|--------|---------|--------|
 | Align to `sof_timestamp_ns` (not PTS) | SEI / `.vts` | delivery latency (~30–40 ms) | sub-ms precision on the IMU clock |
 | Add `timeshift_cam_imu` | `calibration.json` (Kalibr) | readout-centre + IMU/pipeline offset (~15 ms) | physically-correct cam↔IMU alignment |
-| Apply `line_delay` per row | `readout_time_us` / height | intra-frame rolling-shutter skew | pixel-accurate timing |
+| Apply `line_delay` per row | `readout_time_us` / height | intra-frame rolling-shutter skew | pixel-accurate timing (rolling shutter only; `0` on global-shutter cameras) |
