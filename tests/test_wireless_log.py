@@ -89,3 +89,24 @@ def test_legacy_v1(tmp_path):
     assert len(s.device_ms) == 0 and s.live_fit is not None
     assert log.events[0].kind == "started" and log.events[0].segment is None
     assert len(log.clock_refs) == 1
+
+
+def test_unit_identity_keys(tmp_path):
+    """Firmware 0.5.9+ exports the camera's board / generation / firmware per unit."""
+    import json
+    from trinet_tools.wireless_log import load_logs
+    p = tmp_path / "id.jsonl"
+    lines = [
+        {"type": "header", "format": "trinet-wireless-log", "version": 2, "store_id": "s1",
+         "bucket_ms": 5000},
+        {"type": "unit", "unit_id": "a1b2c3d4", "group_id": 0, "last_role": "unpaired",
+         "board": "pro_stereo_gs", "hw_generation": "v6", "fw_version": "0.5.9", "build": "shipping"},
+        {"type": "unit", "unit_id": "0000beef", "group_id": 0, "last_role": "unpaired"},
+        {"type": "end", "records": 3},
+    ]
+    p.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+    log = load_logs([str(p)])
+    u = log.units["a1b2c3d4"]
+    assert (u.board, u.hw_generation, u.fw_version, u.build) == ("pro_stereo_gs", "v6", "0.5.9", "shipping")
+    assert log.units["0000beef"].board is None
+    assert not log.warnings

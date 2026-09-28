@@ -90,6 +90,11 @@ class UnitInfo:
     group_id: Optional[int] = None
     last_role: Optional[str] = None
     last_address: Optional[str] = None
+    # From the camera's identity broadcast (firmware 0.5.9+); None when unknown.
+    board: Optional[str] = None          # pro_mono | pro_stereo | pro_stereo_gs
+    hw_generation: Optional[str] = None  # e.g. "v6"
+    fw_version: Optional[str] = None     # e.g. "0.5.9"
+    build: Optional[str] = None          # shipping | dev
 
 
 @dataclass
@@ -388,6 +393,9 @@ def _parse_v2(text: str, path: str, sha: str, log: WirelessLog) -> LogFile:
                 u.group_id = _int(o.get("group_id"), u.group_id)
                 u.last_role = _role_name(o.get("last_role")) or u.last_role
                 u.last_address = o.get("last_address") or u.last_address
+                for key in ("board", "hw_generation", "fw_version", "build"):
+                    if o.get(key) is not None:
+                        setattr(u, key, str(o.get(key)))
                 log.units[uid] = u
         elif t == "segment":
             log.segments.append(_parse_segment(o, store_id, path))

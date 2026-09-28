@@ -78,9 +78,22 @@ between consecutive references (or a `time_set` record) is a clock step.
 ### `unit`
 ```json
 {"type":"unit","unit_id":"a1b2c3d4","label":"Left wrist","group_id":33012,
- "last_role":"slave","last_address":"D2:80:A1:B2:C3:D4"}
+ "last_role":"slave","last_address":"D2:80:A1:B2:C3:D4",
+ "board":"pro_stereo_gs","hw_generation":"v6","fw_version":"0.5.9","build":"shipping"}
 ```
 `group_id` is the 16-bit kit id (0 = not in a kit). `last_role`: `unpaired | master | slave`.
+
+The last four keys come from the camera's identity broadcast (the last one the
+phone heard). They are optional: all four are `null` when the camera never sent
+one (older firmware), and exports from older SDKs omit them — readers must treat a
+missing key as `null`.
+- `board`: `pro_mono | pro_stereo | pro_stereo_gs`, or `null` when unknown
+  (including model numbers newer than the writer). `pro_stereo_gs` is the global
+  shutter model; the others are rolling shutter.
+- `hw_generation`: hardware generation, e.g. `"v6"`, or `null` when unknown.
+- `fw_version`: firmware version, e.g. `"0.5.9"`, or `null` when the camera did not
+  know its version.
+- `build`: `shipping | dev`, or `null` when no identity was heard.
 
 ### `segment`
 ```json

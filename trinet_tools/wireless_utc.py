@@ -1840,7 +1840,9 @@ def inspect_log(log: WirelessLog, cfg: Optional[MatchConfig] = None) -> List[str
              f"{len(log.events)} event(s)")
     for uid in sorted(log.units):
         u = log.units[uid]
-        L.append(f"unit {uid}  label={u.label!r} group={u.group_id} role={u.last_role}")
+        ident = (f"  {u.board} {u.hw_generation or ''} fw {u.fw_version or '?'} ({u.build or '?'})"
+                 if u.board else "  identity unknown")
+        L.append(f"unit {uid}  label={u.label!r} group={u.group_id} role={u.last_role}{ident}")
         for r in (x for x in runs if x.unit_id == uid):
             lo, hi = r.span_ms
             dur_h = max((hi - lo) / 3.6e6, 1e-9)

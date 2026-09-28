@@ -34,6 +34,11 @@ overwritten without `--force`), a kit-consistency check per session, and
 `--inspect` to see what an export contains. Stereo, kit and single-camera card
 layouts are all recognised, including chunked recordings.
 
+**Which camera is which.** Exports from the app now carry each camera's model
+(Pro Mono / Pro Stereo / Pro Stereo GS), hardware generation, firmware version
+and build (`board`, `hw_generation`, `fw_version`, `build` on each `unit`
+record; absent for cameras on firmware before 0.5.9). `--inspect` lists them.
+
 **Also new**
 - `trinet_tools.tmf.read_tmf_meta()` reads a recording's embedded metadata
   without reading the whole file.
