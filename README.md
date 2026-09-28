@@ -15,6 +15,7 @@ This repository gives you everything you need to:
 - **Visualize** a single recording as a synchronized video + inertial-plot
   composite for sanity checking and demos.
 - **Export** a recording to MCAP for Foxglove and ROS 2 tooling.
+- **Timestamp** card recordings in UTC from the phone app's wireless status log.
 - **Combine** several cameras from the same take into one synced, side-by-side
   video — optionally with a per-camera orientation gizmo — so a multi-camera rig
   (e.g. a head plus two wrist cameras) plays back on a single shared timeline.
@@ -33,6 +34,8 @@ pip install -r requirements.txt
 
 `ffmpeg` and `ffprobe` must be on your `PATH` for the SEI extractor and the
 visualizer (most package managers install them as one package).
+
+To run the tests: `pip install -r requirements-dev.txt && python3 -m pytest -q`.
 
 ## Recording layouts you may encounter
 
@@ -263,6 +266,22 @@ python scripts/to_mcap.py /data/take0004_L.mp4      # stereo take -> take0004.mc
 Video frames are copied, not re-encoded. Topics, timestamps and rolling-shutter
 row timing: [docs/mcap_export.md](docs/mcap_export.md).
 
+### Put card recordings on UTC
+
+The camera has no wall clock, but while it records it broadcasts its status
+over Bluetooth LE, and the Trinet phone app logs it. Export that log and the tool
+gives every take on the cards the UTC time of its first and last frame (or of
+every frame), with an uncertainty and a confidence:
+
+```bash
+python scripts/wireless_utc.py phone_export.jsonl.gz --recordings /media/CARD1 /media/CARD2
+python scripts/wireless_utc.py phone_export.jsonl.gz --recordings cards/ --per-frame --write-sidecars
+```
+
+Keep the phone app monitoring for the whole session. Method, accuracy and
+output columns: [docs/wireless_utc.md](docs/wireless_utc.md); the log format:
+[docs/wireless_log_format.md](docs/wireless_log_format.md).
+
 ### Inspect a recording from the shell (no plots, just numbers)
 
 ```bash
@@ -359,7 +378,8 @@ Highlights:
 
 - **All timestamps are monotonic nanoseconds**, not wall-clock — they reset to
   0 every time the camera powers on. This is what gives you tight, jitter-free
-  inertial-to-video alignment.
+  inertial-to-video alignment. To place recordings in UTC, see
+  [docs/wireless_utc.md](docs/wireless_utc.md).
 - **Frame-sync alignment**: when enabled by firmware, every video frame
   triggers a hardware pulse to the inertial sensor. The first IMU sample
   after each pulse carries a sub-microsecond `fsync_delay_us`, letting you

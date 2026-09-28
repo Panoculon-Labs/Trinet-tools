@@ -25,6 +25,9 @@ Library:
   t.calib_blob      # bytes (TBLC) or None
   t.imu_bytes()     # full .imu file image (header + samples) or None
   t.vts_bytes()     # full .vts file image or None
+
+  from trinet_tools.tmf import read_tmf_meta
+  read_tmf_meta("take0001_L.mp4")   # just the tmfm dict; seeks, no whole-file read
 """
 
 from __future__ import annotations
@@ -142,6 +145,72 @@ class TmfRecording:
         hdr = bytearray(self.tel_header)
         struct.pack_into("<I", hdr, 16, self.tel_record_count)
         return bytes(hdr) + bytes(self.tel_records)
+
+
+def _file_boxes(f, start: int, end: int):
+    """Yield (type, offset, size, header_len) of the boxes in [start, end) of an
+    open file, reading only the box headers (seek-based, no payload reads)."""
+    o = start
+    while o + 8 <= end:
+        f.seek(o)
+        h = f.read(16)
+        if len(h) < 8:
+            break
+        (sz,) = struct.unpack_from(">I", h, 0)
+        hdr = 8
+        if sz == 1:
+            if len(h) < 16:
+                break
+            (sz,) = struct.unpack_from(">Q", h, 8)
+            hdr = 16
+        elif sz == 0:
+            sz = end - o
+        if sz < hdr or o + sz > end:
+            break
+        yield h[4:8], o, sz, hdr
+        o += sz
+
+
+def read_tmf_meta(path: str | Path) -> dict | None:
+    """Return the ``tmfm`` take-meta JSON of a Trinet MP4 (or None if absent)
+    without reading the whole file: only box headers are read while seeking to
+    the LAST top-level ``moov`` (flatten appends the rebuilt moov at EOF), then
+    ``moov/udta/tmfm`` is read. Same result as ``read_tmf(path).meta``.
+
+    Raises ValueError if the file has no ``moov`` box (truncated recording).
+    """
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        moovs = [(o, sz, hdr) for k, o, sz, hdr in _file_boxes(f, 0, size) if k == b"moov"]
+        if not moovs:
+            raise ValueError(f"{path}: no moov box (truncated recording?)")
+        mo, msz, mhdr = moovs[-1]
+
+        def find_udta(start, end):
+            for kind, o, sz, hdr in _file_boxes(f, start, end):
+                if kind == b"udta":
+                    return o, sz, hdr
+                if kind in _CONTAINERS:
+                    r = find_udta(o + hdr, o + sz)
+                    if r:
+                        return r
+            return None
+
+        udta = find_udta(mo + mhdr, mo + msz)
+        if not udta:
+            return None
+        uo, usz, uhdr = udta
+        meta = None
+        for kind, o, sz, hdr in list(_file_boxes(f, uo + uhdr, uo + usz)):
+            if kind == b"tmfm":
+                f.seek(o + hdr)
+                body = f.read(sz - hdr)
+                try:
+                    meta = json.loads(body)
+                except json.JSONDecodeError:
+                    meta = None
+        return meta
 
 
 def read_tmf(path: str | Path) -> TmfRecording:

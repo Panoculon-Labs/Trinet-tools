@@ -1,0 +1,4 @@
+# Test configuration only (the toolkit itself is used from a checkout; see README).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

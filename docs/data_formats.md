@@ -7,6 +7,7 @@ own reader, validator, or exporter without depending on the Python tools.
 All multi-byte integers and floats are **little-endian**. All timestamps are
 **monotonic nanoseconds** (i.e. they always increase, but they are not wall-clock
 times — they reset to 0 when the camera powers up).
+To map them to UTC, see [`wireless_utc.md`](wireless_utc.md).
 
 > The format `version` (in each file's header, right after the magic) tells you
 > which camera generation produced the recording and which timestamp to align to.
@@ -356,6 +357,12 @@ so `.imu` reconstruction is IHDR + rows rebuilt from the columns; `TFRM` and
   "thermal": {"min_c": 40.1, "max_c": 55.2, "samples": 30}
 }
 ```
+
+  Newer firmware also writes `"boot_id"` (32 lowercase hex, unique per camera
+  power-on; its first byte is the boot nonce the camera broadcasts over the
+  wireless status link) and `"boot_id_source"` (`"live"`, or `"marker"` for a take
+  recovered after a power loss). [`wireless_utc.md`](wireless_utc.md) uses it to
+  tie a take to the camera boot the phone heard.
 
   `drops` is the camera's own frame-continuity summary for the take (gaps
   detected from per-frame timestamps, list capped at 64); `sync` mirrors the
