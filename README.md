@@ -340,6 +340,11 @@ Stereo takes (`<take>_L.mp4` + `<take>_R.mp4`) are self-contained: frame
 pairing, IMU, and the camera's calibration are read from the files themselves.
 
 ```bash
+# Field check: does the stereo calibration still fit? No target needed — run on a
+# few seconds of a well-lit, textured scene. Prints the vertical offset between the
+# rectified eyes and ok / check / recalibrate (exit 0 / 1 / 2; 3 = inconclusive).
+python3 scripts/check_calibration.py captures/take0002
+
 # Metric stereo depth video: rectified L|R, SGBM depth (add WLS smoothing
 # with --wls if opencv-contrib-python is installed), optional gyro/accel strip.
 python3 scripts/stereo_depth_video.py captures/take0002 out_depth.mp4 --wls --imu --ema 0.5

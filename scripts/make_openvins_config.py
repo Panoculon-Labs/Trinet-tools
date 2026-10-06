@@ -224,8 +224,8 @@ def main():
                 pairs.append((i, j, int(t)))
         _, shift = auto_align(src, mp4_r, pairs, calib)
         if abs(shift) > 0.5:
-            print(f"[auto-align] folding {shift:+.1f} px vertical offset into "
-                  f"cam1 cy (mount moved since calibration)")
+            print(f"[auto-align] folding {shift:+.2f} px vertical offset into "
+                  f"cam1 cy")
             calib["cameras"][1]["intrinsics"]["cy"] += shift
 
     args.out.mkdir(parents=True, exist_ok=True)
