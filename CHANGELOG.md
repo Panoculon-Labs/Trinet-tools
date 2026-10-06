@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — stereo calibration field check (`scripts/check_calibration.py`)
+
+A target-free check that a stereo camera's calibration still fits, run on an
+ordinary recording. It measures the constant vertical offset between the
+rectified eyes and prints ok (≤ 1.5 px), check (1.5–3 px) or recalibrate
+(> 3 px), with exit status 0 / 1 / 2 (3 = too few features to measure).
+
+- `stereo_align`: the offset is now measured with sub-pixel optical flow
+  (forward-backward checked) over 15 frame pairs instead of whole-pixel ORB
+  matches over 5, and reported with its spread across the take
+  (`measure_y_offset`, `calibration_verdict`). On the published Stereo GS
+  sample it reads +0.69 px (independent measurement: +0.56 px); a 4 px shift of
+  one eye's calibration reads +5.0 px → recalibrate.
+- `stereo_depth_video.py` always prints the measured offset and its verdict;
+  the "consider recalibrating" message now appears only above 1.5 px (it fired
+  at 0.5 px before, which healthy units exceed).
+
 ## Unreleased — put card recordings on UTC (`scripts/wireless_utc.py`)
 
 Trinet cameras that record to their own memory card can broadcast their status

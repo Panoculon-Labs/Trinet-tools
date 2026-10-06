@@ -43,7 +43,8 @@ for _p in [Path(__file__).resolve().parent.parent, Path.cwd()]:
 
 from trinet_tools import calib_blob                           # noqa: E402
 from trinet_tools.reader import read_imu, read_vts            # noqa: E402
-from trinet_tools.stereo_align import Rectification, auto_align  # noqa: E402
+from trinet_tools.stereo_align import (Rectification, auto_align,  # noqa: E402
+                                       calibration_verdict)
 from trinet_tools.tmf import read_tmf                         # noqa: E402
 
 
@@ -286,10 +287,12 @@ def main():
     else:
         rect = Rectification(calib)
         rect, shift = auto_align(mp4_l, mp4_r, pairs, calib)
-        if abs(shift) > 0.5:
-            print(f"[auto-align] residual vertical offset {shift:+.1f} px "
-                  f"absorbed into rectification (stereo mount has moved "
-                  f"since calibration — consider recalibrating)")
+        verdict = calibration_verdict(shift)
+        print(f"[auto-align] vertical offset {shift:+.2f} px absorbed into "
+              f"rectification ({verdict})")
+        if verdict in ("check", "recalibrate"):
+            print("[auto-align] the stereo mount may have moved since calibration — "
+                  "run scripts/check_calibration.py on a textured take to confirm")
     m0, m1 = rect.map_l, rect.map_r
     fx, baseline = rect.fx, rect.baseline_m
     print(f"baseline {baseline*1000:.1f} mm (from "

@@ -9,18 +9,24 @@ of one camera / principal-point shift), which silently ruins row-search stereo
 matching and degrades VIO stereo tracking.
 
 This module measures that residual from a take itself (median vertical
-parallax of ORB matches over rectified sample pairs) and folds it into the
-right camera's principal point. Usage:
+parallax of features tracked from the left to the right rectified eye, with
+sub-pixel optical flow, over pairs spread across the take) and can fold it
+into the right camera's principal point. Usage:
 
-    from trinet_tools.stereo_align import rectification, auto_align
+    from trinet_tools.stereo_align import (rectification, auto_align,
+                                           measure_y_offset, calibration_verdict)
 
     rect = rectification(calib)                      # maps from a calibration
+    m = measure_y_offset(mp4_l, mp4_r, pairs, rect)  # field check (dict)
+    calibration_verdict(m["offset_px"])              # "ok" / "check" / "recalibrate"
     rect, shift = auto_align(mp4_l, mp4_r, pairs, calib)   # + per-take fix
 
-A |shift| of more than a pixel or two means the mount has moved since
-calibration — the correction keeps depth working, but recalibrating restores
-fully trustworthy metric geometry (a large shift can also carry smaller
-uncorrected components: roll, focal change if a lens was touched).
+Healthy units read a few tenths of a pixel to about one pixel; a residual of
+more than ~3 px means the mount has moved since calibration — the correction
+keeps depth working, but recalibrating restores fully trustworthy metric
+geometry (a large shift can also carry smaller uncorrected components: roll,
+focal change if a lens was touched). `scripts/check_calibration.py` wraps the
+measurement as a field check.
 """
 
 from __future__ import annotations
@@ -90,16 +96,50 @@ def rectification(calib: dict, size=(1920, 1080)) -> Rectification:
     return Rectification(calib, size)
 
 
-def rect_y_offset(mp4_l, mp4_r, pairs, rect: Rectification,
-                  samples: int = 5) -> float | None:
-    """Median vertical parallax (yL - yR) of ORB matches over [samples]
-    rectified pairs spread across the take. ~0 for healthy geometry;
-    None when there aren't enough matches to trust."""
-    orb = cv2.ORB_create(2000)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+# Field-check thresholds on |vertical offset| between the rectified eyes, in
+# pixels at 1920x1080. Set from the published sample recordings (healthy units
+# read ~0.5-1 px) with headroom; see scripts/check_calibration.py.
+OK_MAX_PX = 1.5
+CHECK_MAX_PX = 3.0
+MIN_POINTS = 200          # fewer tracked points -> "inconclusive"
+
+
+def pair_y_offsets(rl, rr, max_corners: int = 1500) -> np.ndarray:
+    """Vertical parallax (yL - yR) of features tracked from the rectified left
+    image `rl` into the rectified right image `rr` (both 8-bit grayscale).
+
+    Corners are tracked with pyramidal Lucas-Kanade (sub-pixel), checked by
+    tracking back (forward-backward error < 0.5 px), and kept only with a
+    plausible stereo disparity (0 < xL - xR < 300 px) and |dy| < 60 px."""
+    pts = cv2.goodFeaturesToTrack(rl, maxCorners=max_corners, qualityLevel=0.01,
+                                  minDistance=8, blockSize=7)
+    if pts is None or len(pts) == 0:
+        return np.empty(0)
+    lk = dict(winSize=(21, 21), maxLevel=4,
+              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01))
+    p1, st1, _ = cv2.calcOpticalFlowPyrLK(rl, rr, pts, None, **lk)
+    p0b, st2, _ = cv2.calcOpticalFlowPyrLK(rr, rl, p1, None, **lk)
+    fb = np.linalg.norm((pts - p0b).reshape(-1, 2), axis=1)
+    good = (st1.ravel() == 1) & (st2.ravel() == 1) & (fb < 0.5)
+    a, b = pts.reshape(-1, 2)[good], p1.reshape(-1, 2)[good]
+    dx, dy = a[:, 0] - b[:, 0], a[:, 1] - b[:, 1]
+    keep = (dx > 0) & (dx < 300) & (np.abs(dy) < 60)
+    return dy[keep]
+
+
+def measure_y_offset(mp4_l, mp4_r, pairs, rect: Rectification,
+                     samples: int = 15) -> dict:
+    """Measure the vertical offset between the rectified eyes over [samples]
+    frame pairs spread across the take.
+
+    Returns {"offset_px": median yL - yR or None, "spread_px": interquartile
+    range of the per-frame medians, "points": tracked points used,
+    "frames": frame pairs that contributed}. offset_px is None (inconclusive)
+    when fewer than MIN_POINTS points could be tracked — e.g. a featureless or
+    dark scene."""
     caps = (cv2.VideoCapture(str(mp4_l)), cv2.VideoCapture(str(mp4_r)))
-    dys = []
-    for k in np.linspace(0.1, 0.9, samples):
+    all_dy, per_frame = [], []
+    for k in np.linspace(0.05, 0.95, samples):
         il, ir, _ = pairs[int(k * (len(pairs) - 1))]
         caps[0].set(cv2.CAP_PROP_POS_FRAMES, il)
         caps[1].set(cv2.CAP_PROP_POS_FRAMES, ir)
@@ -109,18 +149,36 @@ def rect_y_offset(mp4_l, mp4_r, pairs, rect: Rectification,
             continue
         rl = rect.remap(cv2.cvtColor(L, cv2.COLOR_BGR2GRAY), "L")
         rr = rect.remap(cv2.cvtColor(R, cv2.COLOR_BGR2GRAY), "R")
-        kL, dL = orb.detectAndCompute(rl, None)
-        kR, dR = orb.detectAndCompute(rr, None)
-        if dL is None or dR is None:
-            continue
-        for m in bf.match(dL, dR):
-            dx = kL[m.queryIdx].pt[0] - kR[m.trainIdx].pt[0]
-            dy = kL[m.queryIdx].pt[1] - kR[m.trainIdx].pt[1]
-            if 0 < dx < 300 and abs(dy) < 60:
-                dys.append(dy)
+        dys = pair_y_offsets(rl, rr)
+        if len(dys) >= 20:
+            all_dy.append(dys)
+            per_frame.append(float(np.median(dys)))
     for c in caps:
         c.release()
-    return float(np.median(dys)) if len(dys) > 100 else None
+    n = int(sum(len(d) for d in all_dy))
+    if n < MIN_POINTS:
+        return {"offset_px": None, "spread_px": None, "points": n, "frames": len(per_frame)}
+    pf = np.array(per_frame)
+    return {"offset_px": float(np.median(np.concatenate(all_dy))),
+            "spread_px": float(np.subtract(*np.percentile(pf, [75, 25]))),
+            "points": n, "frames": len(per_frame)}
+
+
+def calibration_verdict(offset_px: float | None) -> str:
+    """'ok' / 'check' / 'recalibrate' from a measured vertical offset, or
+    'inconclusive' when it could not be measured."""
+    if offset_px is None:
+        return "inconclusive"
+    a = abs(offset_px)
+    return "ok" if a <= OK_MAX_PX else ("check" if a <= CHECK_MAX_PX else "recalibrate")
+
+
+def rect_y_offset(mp4_l, mp4_r, pairs, rect: Rectification,
+                  samples: int = 15) -> float | None:
+    """Median vertical parallax (yL - yR) over [samples] rectified pairs spread
+    across the take. ~0 for healthy geometry; None when there aren't enough
+    tracked points to trust. See measure_y_offset for the details."""
+    return measure_y_offset(mp4_l, mp4_r, pairs, rect, samples)["offset_px"]
 
 
 def auto_align(mp4_l, mp4_r, pairs, calib: dict, size=(1920, 1080),
