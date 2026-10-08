@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — re-sync long multi-camera takes onto the master clock (`scripts/resync_take.py`)
+
+A synced camera's `.vts` (v3/v4) records the clock offset to the group master
+once, at the start of the take. Camera clocks run a few parts per million apart,
+so on long takes the recorded timelines slowly separate even though the frames
+themselves stay locked together — typically 5–15 ms per hour, and growing.
+
+- `resync_take.py` measures the real clock relationship from the recording:
+  it pairs every frame with the master frame it was captured with, fits the
+  offset across the take (following slow rate changes as the units warm up),
+  and rewrites each camera's frame **and** IMU timestamps onto the master's
+  clock. Output files keep the input format with the header offset zeroed, so
+  every existing tool reads them unchanged; originals are never modified.
+- Also writes a frame-matching CSV (each master frame → the matching frame of
+  every camera), a JSON report, and with `--plot` a before/after chart.
+- On a 47-minute three-camera take the old timeline had drifted 6.8 / 12.7 ms;
+  after re-sync the cameras agree to 0.06 ms (median). On a simulated 2-hour
+  take with 9 ppm drift, thermal wander and dropped frames, the offset is
+  recovered to under 0.2 ms (`tests/test_resync_take.py`).
+- `--check-video` scans each `.mp4` for damaged frames (no decoding, ~2 s per
+  file). Decoders drop or stall on them, which shifts every later frame against
+  its timestamp in tools that count decoded frames, such as `sync_view.py`.
+
 ## Unreleased — stereo calibration field check (`scripts/check_calibration.py`)
 
 A target-free check that a stereo camera's calibration still fits, run on an
