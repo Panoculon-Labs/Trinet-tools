@@ -253,6 +253,41 @@ camera is auto-detected and shown as the `ref` panel. If a camera is mounted
 upside-down — common for wrist units — flip its panel with `--rotate180`, e.g.
 `--rotate180 0,2` for the first and third panels.
 
+### Long multi-camera takes: re-sync timestamps onto the master clock
+
+A synced slave's `.vts` (v3/v4) stores the clock offset to the master once, when
+the recording starts. The cameras' clocks run a few parts-per-million apart, so
+over a long take the recorded timelines slowly separate (typically 5–15 ms per
+hour, growing with length) even though the frames themselves stay locked
+together. `resync_take.py` measures the real clock relationship from the
+recording and rewrites every slave timestamp — frames **and** IMU samples — onto
+the master's clock:
+
+```bash
+# one take: pass every camera (the master is auto-detected)
+python scripts/resync_take.py head/grp1_aaaa_1 left/grp1_bbbb_1 right/grp1_cccc_1 -o resynced/ --plot
+
+# every take under a folder, grouped by session id
+python scripts/resync_take.py --auto /path/to/recordings -o resynced/
+```
+
+The output folder holds corrected `.vts`/`.imu` files in the same binary
+format (header offset 0, so any tool reading them gets master-clock times
+directly), links to the original videos, a `<session>_frames.csv` that matches
+each master frame to the corresponding frame of every other camera, and a
+`<session>_resync.json` report (clock rate, fit residual, how far the old
+timeline had drifted). Originals are never modified. You can point
+`sync_view.py` at the output folder. Add `--check-video` to confirm each
+`.mp4` has exactly as many frames as its `.vts` (needs `ffprobe`); a mismatch
+shifts video against timestamps by whole frames and is a separate problem from
+clock drift.
+
+Frame times keep their mid-exposure meaning. Cameras running different
+exposures (e.g. a wrist camera in shadow) are genuinely captured a few
+milliseconds apart at the exposure centre — the frames CSV reports that offset
+instead of hiding it. Recordings in `.vts` v5 already carry the offset for
+every frame and don't need this step.
+
 ### Export to MCAP (Foxglove / ROS 2)
 
 Convert any recording (single camera or stereo, global or rolling shutter,
