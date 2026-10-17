@@ -110,6 +110,36 @@ print(rec.meta["drops"])                 # camera's own frame-drop summary
 calib = calib_blob.unpack(rec.calib_blob)  # intrinsics/extrinsics/IMU noise
 ```
 
+### Get your camera's calibration (from an MP4, over USB or over NCM)
+
+`get_calibration.py` writes the calibration stored on your camera as
+`calibration.json`, which works with every command here that takes
+`--calibration`. You can get it from a recording, or from the live camera:
+
+```bash
+# From any recording the camera made (either eye of a stereo take). Works on any OS.
+python3 scripts/get_calibration.py --mp4 take0001_L.mp4
+
+# From the camera over USB in webcam mode (no memory card). Linux only.
+python3 scripts/get_calibration.py --uvc              # or: --uvc /dev/video2
+
+# From the camera over USB networking in network (NCM / iPhone) mode. Trinet Mono only.
+python3 scripts/get_calibration.py --ncm              # or: --ncm 172.32.18.70
+
+# Options: -o PATH for the JSON, --bin PATH to also save the raw blob as stored
+# on the camera. Exit codes: 0 written, 1 no calibration stored, 2 error.
+```
+
+In webcam mode the camera answers the read while another app is streaming
+from it. In network mode the tool finds the camera by itself: the camera gives
+the computer the address `172.32.<X>.71` and answers on `172.32.<X>.70`. Its
+HTTP API is `GET http://172.32.<X>.70:8081/api/calibration`, which returns the
+raw blob, or 404 when no calibration is stored. Trinet Mono cameras without the
+per-unit calibration service have none stored; use the
+[reference calibration](https://github.com/Panoculon-Labs/Trinet-BatchCalibrations)
+for your hardware version. In Python, see `trinet_tools.device_calibration`
+(`from_mp4`, `read_uvc`, `read_ncm`, `to_calibration_json`).
+
 ### Recording shows only ~1 second? Repair it (bulk)
 
 Some recordings play back as only **~1 second long** (or get rejected as

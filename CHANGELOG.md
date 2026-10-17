@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — get a camera's calibration (`scripts/get_calibration.py`)
+
+Reads the calibration stored on a camera and writes it as `calibration.json`,
+accepted wherever the toolkit takes `--calibration`. There are three sources:
+
+- `--mp4 FILE`: the copy embedded in every recording. Works on any OS.
+- `--uvc [DEVICE]`: the live camera over USB in webcam mode, on Linux, through
+  the camera's UVC extension unit. It works while another app is streaming.
+- `--ncm [IP]`: the live camera in network (NCM) mode, through
+  `GET /api/calibration` on port 8081. The camera's address is found from the
+  USB-network interface.
+
+`--bin` also saves the raw on-camera blob, 200 bytes for a single camera or 300
+for stereo. The device-binding field is left out of the JSON. Exit codes: 0
+written, 1 no calibration stored, 2 error. Library:
+`trinet_tools.device_calibration`.
+
 ## Unreleased — re-sync long multi-camera takes onto the master clock (`scripts/resync_take.py`)
 
 A synced camera's `.vts` (v3/v4) records the clock offset to the group master
