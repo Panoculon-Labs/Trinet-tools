@@ -41,7 +41,7 @@ def test_mono_blob_to_json():
                                            "distortion": [0.1, -0.02, 0.003, -0.001]}})
     assert len(blob) == 200
     calib = dc.to_calibration_json(dc.reassemble_chunks(_frames(blob)))
-    assert calib["intrinsics"]["cx"] == 960.0 and "chip_id" not in calib
+    assert calib["intrinsics"]["cx"] == 960.0 and dc.DEVICE_BINDING_KEY not in calib
 
 
 def test_reassemble_chunks_rejects_malformed():
@@ -64,6 +64,8 @@ def test_ncm_camera_ips_from_ip_and_ifconfig():
     assert dc.ncm_camera_ips(ip_out) == ["172.32.18.70", "172.32.203.70"]
     ifconfig_out = "en7: flags=8863<UP>\n\tinet 172.32.44.71 netmask 0xffffff00 broadcast 172.32.44.255\n"
     assert dc.ncm_camera_ips(ifconfig_out) == ["172.32.44.70"]
+    ipconfig_out = "   IPv4 Address. . . . . . . . . . . : 172.32.7.71\r\n   Subnet Mask . . . : 255.255.255.0\r\n"
+    assert dc.ncm_camera_ips(ipconfig_out) == ["172.32.7.70"]
     assert dc.ncm_camera_ips("inet 172.32.9.70/24") == []    # that's the camera side, not ours
 
 
@@ -109,7 +111,7 @@ def test_from_mp4_and_json():
     blob = dc.from_mp4(EXAMPLE)
     assert blob and blob[:4] == b"TBLC"
     calib = dc.to_calibration_json(blob)
-    assert "chip_id" not in calib and calib.get("cameras")
+    assert dc.DEVICE_BINDING_KEY not in calib and calib.get("cameras")
 
 
 @pytest.mark.skipif(not EXAMPLE.exists(), reason="example recording not present")

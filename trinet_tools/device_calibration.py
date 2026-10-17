@@ -48,6 +48,10 @@ NCM_PORT = 8081
 # In network mode the camera hands the computer 172.32.<X>.71 and answers on .70.
 _NCM_HOST_RE = re.compile(r"\b172\.32\.(\d{1,3})\.71\b")
 
+# Field of calib_blob.unpack() output that binds a blob to one device; not
+# needed to use the calibration, so it is left out of calibration.json.
+DEVICE_BINDING_KEY = "chip_id"
+
 
 class CalibrationError(RuntimeError):
     pass
@@ -159,7 +163,7 @@ def ncm_camera_ips(ip_addr_text: str | None = None) -> list[str]:
     computer's own interface addresses (172.32.<X>.71 -> camera 172.32.<X>.70)."""
     if ip_addr_text is None:
         ip_addr_text = ""
-        for cmd in (["ip", "-4", "-o", "addr"], ["ifconfig"]):
+        for cmd in (["ip", "-4", "-o", "addr"], ["ifconfig"], ["ipconfig"]):
             try:
                 ip_addr_text = subprocess.run(cmd, capture_output=True, text=True,
                                               timeout=5).stdout
@@ -203,5 +207,5 @@ def to_calibration_json(blob: bytes) -> dict:
     """The blob as a calibration dictionary (accepted wherever the toolkit takes
     --calibration). The device-binding field is left out."""
     calib = calib_blob.unpack(blob)
-    calib.pop("chip_id", None)
+    calib.pop(DEVICE_BINDING_KEY, None)
     return calib
