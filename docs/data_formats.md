@@ -396,6 +396,9 @@ exact struct layouts — is [`trinet_tools/calib_blob.py`](../trinet_tools/calib
 blob. The end-to-end notebook
 [`examples/tmf_metadata_and_calibration.ipynb`](../examples/tmf_metadata_and_calibration.ipynb)
 decodes the blob straight out of an MP4 and undistorts a frame with it.
+[`scripts/get_calibration.py`](../scripts/get_calibration.py) fetches the blob
+from an MP4, from a live camera over USB (webcam mode) or over USB networking
+(NCM, `GET /api/calibration`), and writes it as `calibration.json`.
 
 ## `.json` recording-meta sidecar
 
