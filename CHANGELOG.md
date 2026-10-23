@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — check recordings and kit takes (`scripts/check_recording.py`)
+
+One report per take: frames in the `.vts` and the `.mp4`, dropped frames
+(counted from intervals over 1.5 frame periods; the first second is reported
+separately as start-up), measured fps, duration, video bitrate, codec, audio,
+whether the motion data and timestamps are also embedded in the `.mp4`, and the
+`.imu` rate and longest gap. Give it per-camera folders and it matches kit takes
+by their `grp` number, then reports for each camera whether it was synced and
+its frame alignment to the kit's master (median, p95, max, first 2 s skipped),
+plus left/right eye alignment on stereo cameras. Kit takes are expected at about
+29.7 fps; single cameras at 30. `--json` writes the full report; exit status 1
+if any check warned.
+
 ## Unreleased — get a camera's calibration (`scripts/get_calibration.py`)
 
 Reads the calibration stored on a camera and writes it as `calibration.json`,
