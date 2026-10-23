@@ -85,3 +85,36 @@ def test_kit_take_across_folders(tmp_path):
     assert not any("dropped" in m for _, m in t["checks"]), out
     assert "29.7 fps by design" in out
     assert p.returncode == 1
+
+
+def test_one_camera_of_a_kit_alone(tmp_path):
+    """A kit camera checked on its own: synced is reported, no alignment warnings."""
+    n = 600
+    off = 250_000_000
+    local = 5 * 10**9 + np.arange(n, dtype=np.int64) * KIT_PERIOD - off
+    write_vts(tmp_path / "grp42_bbbbbbbb_1.vts", local, version=5, sync=(off, 0, 20, 1),
+              frame_offset_ns=np.full(n, off))
+    report = tmp_path / "one.json"
+
+    p = _run(tmp_path / "grp42_bbbbbbbb_1.vts", "--json", report)
+    t = json.loads(report.read_text())[0]
+    assert t["kit"] and len(t["cameras"]) == 1
+    assert "synced: yes" in p.stdout
+    assert not any("alignment" in m or "master" in m for _, m in t["checks"]), p.stdout
+
+
+def test_kit_without_master_uses_first_camera_as_reference(tmp_path):
+    n = 600
+    grid = 5 * 10**9 + np.arange(n, dtype=np.int64) * KIT_PERIOD
+    for d, tag in (("left", "bbbbbbbb"), ("right", "cccccccc")):
+        (tmp_path / d).mkdir()
+        write_vts(tmp_path / d / f"grp42_{tag}_1.vts", grid - 10**8, version=5, sync=(10**8, 0, 20, 1),
+                  frame_offset_ns=np.full(n, 10**8))
+    report = tmp_path / "two.json"
+
+    p = _run(tmp_path / "left", tmp_path / "right", "--json", report)
+    t = json.loads(report.read_text())[0]
+    msgs = [m for _, m in t["checks"] if "alignment" in m or "master" in m or "overlap" in m]
+    assert t["reference"].startswith("left/")
+    assert t["cameras"][1]["sync"]["p95_abs_ms"] < 0.01
+    assert len(msgs) == 1 and "master camera not among" in msgs[0], p.stdout
