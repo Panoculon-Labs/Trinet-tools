@@ -249,6 +249,7 @@ def overlap_s(gs):
 def verdicts(take):
     out = []
     kit = take["kit"]
+    multi = len(take["cameras"]) > 1          # alignment needs a second camera to compare with
     for cam in take["cameras"]:
         for s in cam["streams"]:
             tag = f"{cam['name']} {s['file'][-2:]}" if len(cam["streams"]) > 1 else cam["name"]
@@ -272,12 +273,14 @@ def verdicts(take):
             sy = cam.get("sync")
             if not cam["synced"]:
                 out.append(("FAIL", f"{cam['name']}: not synced to the kit for this take"))
+            elif not multi or cam["name"] == take.get("reference"):
+                pass
             elif sy is None:
                 out.append(("WARN", f"{cam['name']}: too little overlap to measure frame alignment"))
             elif sy["p95_abs_ms"] > SYNC_OK_MS:
                 out.append(("WARN", f"{cam['name']}: frame alignment p95 {sy['p95_abs_ms']} ms "
                                     f"(over {SYNC_OK_MS:g} ms)"))
-    if kit and not any(c["role"] == "master" for c in take["cameras"]):
+    if multi and not any(c["role"] == "master" for c in take["cameras"]):
         out.append(("WARN", "kit master camera not among the files; alignment measured against "
                             f"{take['cameras'][0]['name']}"))
     return out
@@ -370,6 +373,8 @@ def print_take(t):
             sy = c["sync"]
             print(f"    synced, frame alignment to reference: median {sy['median_ms']} ms, p95 {sy['p95_abs_ms']} ms, "
                   f"max {sy['max_abs_ms']} ms over {sy['frames']} frames")
+        elif t["kit"] and c["name"] == t.get("reference"):
+            print(f"    synced: {'yes' if c['synced'] else 'NO'} (alignment reference)")
         elif t["kit"] and c["role"] != "master":
             print(f"    synced: {'yes' if c['synced'] else 'NO'}")
     print()
@@ -379,6 +384,8 @@ def print_take(t):
         print(f"  {level}: {msg}")
     if t["kit"]:
         print("  note: kit takes run at about 29.7 fps by design (single cameras: 30 fps)")
+    if t["kit"] and len(t["cameras"]) == 1:
+        print("  note: give the other kit cameras' files or folders too to measure frame alignment")
 
 
 def main():
