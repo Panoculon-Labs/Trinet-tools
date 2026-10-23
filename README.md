@@ -216,6 +216,27 @@ python scripts/visualize.py path/to/recording.mp4 \
 Works on a triple of files (`recording.mp4 + recording.imu + recording.vts`)
 or on a single UVC MP4 after running the SEI extractor.
 
+### Check a recording or a kit take
+
+`check_recording.py` reports frame drops, measured frame rate, duration,
+bitrate, codec, audio and motion data for each video stream, and — for a kit
+take — whether every camera was synced and how closely its frames line up with
+the kit's master camera.
+
+```bash
+# one recording (a stereo eye checks both eyes)
+python scripts/check_recording.py path/to/recording1_1.mp4
+
+# a kit: one folder per camera; takes are matched by their grp number
+python scripts/check_recording.py my-session/head my-session/left my-session/right \
+    --take grp143024 --json report.json
+```
+
+Kit takes run at about 29.7 fps by design so every camera can hold its frames in
+step with the master; a camera recording on its own runs at 30 fps. The exit
+status is 1 if any check warned, so it can gate a batch. `ffprobe` adds the
+codec, bitrate and `.mp4` frame count.
+
 ### Visualize multiple cameras together (synced)
 
 If you recorded the same take with several Trinet cameras — for example a head
