@@ -119,6 +119,15 @@ def ffprobe_decode_map(mp4: Path) -> list[int]:
     return [idx_of[p] for p in frame_pos if p in idx_of]
 
 
+def ffprobe_key_packets(mp4: Path) -> list[bool]:
+    """Per video packet: True for a key frame (IDR)."""
+    out = subprocess.check_output(
+        ["ffprobe", "-hide_banner", "-loglevel", "error",
+         "-select_streams", "v:0", "-show_entries", "packet=flags",
+         "-of", "csv=print_section=0", str(mp4)], text=True)
+    return [ln.strip().startswith("K") for ln in out.splitlines() if ln.strip()]
+
+
 def ffprobe_packet_count(mp4: Path) -> int:
     out = subprocess.check_output(
         ["ffprobe", "-hide_banner", "-loglevel", "error",
@@ -440,6 +449,29 @@ def extract(mp4: Path, out_dir: Path) -> None:
               len(dec2pkt))
     kept_pkts = dec2pkt[n0:]
 
+    # TRINET_EXTRACT_COPY=1: video.mp4 is the camera's own H.264, stream-copied
+    # (no x264 re-encode: ~740 CPU-s per 2.5-min stereo take, and one lossy
+    # generation less under the corner detector). Only when every packet
+    # decodes to exactly one frame (no mid-GOP join, no undecodable AU), so
+    # decoded frame k of video.mp4 is packet n0 + k; the stale head is cut at
+    # the first key frame at/after it (<= 1 GOP of extra standstill frames).
+    copy_mode = os.environ.get("TRINET_EXTRACT_COPY", "") == "1"
+    if copy_mode:
+        keys = ffprobe_key_packets(mp4)
+        k0 = None
+        if dec2pkt == list(range(len(keys))):
+            k0 = next((i for i in range(head_trim, len(keys)) if keys[i]), None)
+        if k0 is None:
+            print("[extract] stream copy not possible (packet/frame mismatch or "
+                  "no key frame) - re-encoding")
+            copy_mode = False
+        else:
+            if k0 > n0:
+                print(f"[extract] stream copy: starting at key frame {k0} "
+                      f"({k0 - n0} more head frame(s) dropped)")
+            n0 = k0
+            kept_pkts = dec2pkt[n0:]
+
     if len(pts_us) < n_frames_total:
         # Pad using nominal fps if ffprobe missed some packets.
         step_us = int(round(1e6 / max(fps, 1.0)))
@@ -527,16 +559,23 @@ def extract(mp4: Path, out_dir: Path) -> None:
     # without an A/B against a stored capture; the real fix is detecting
     # corners on the original stream so the re-encode leaves the accuracy
     # chain entirely.
-    cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-fps_mode:v", "passthrough"]
-    filters = []
-    if n0 > 0:
-        filters.append(f"select=gte(n\\,{n0})")
-    filters.append(f"setpts=N/({true_fps:.6f}*TB)")
-    cmd += ["-vf", ",".join(filters)]
+    if copy_mode:
+        # same uniform timeline as the re-encode, applied to the packets
+        bsf = f"setts=ts=N/({true_fps:.6f}*TB)"
+        if n0 > 0:
+            bsf = f"noise=drop=lt(n\\,{n0})," + bsf
+        cmd += ["-map", "0:v:0", "-c:v", "copy", "-bsf:v", bsf]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-fps_mode:v", "passthrough"]
+        filters = []
+        if n0 > 0:
+            filters.append(f"select=gte(n\\,{n0})")
+        filters.append(f"setpts=N/({true_fps:.6f}*TB)")
+        cmd += ["-vf", ",".join(filters)]
     if have_audio:
         # -c:a copy keeps the camera's AAC bit-exact; no second lossy pass.
-        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
+        cmd += ([] if copy_mode else ["-map", "0:v:0"]) + ["-map", "1:a:0", "-c:a", "copy"]
     else:
         cmd += ["-an"]
     cmd += [str(tmp_mp4)]
