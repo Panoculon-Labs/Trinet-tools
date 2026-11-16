@@ -20,6 +20,8 @@ Public API:
   reader.get_per_frame_fsync_delay_us
   extract_sei.extract(mp4, out)    -> recover sidecars from a UVC MP4
   madgwick.run_madgwick            -> orientation fusion (post-processing)
+  cut.cut_recording(src, t0, t1, out) -> cut a recording to a segment (still a Trinet recording)
+  tmf_write.encode(imu, vts, tel)  -> the embedded metadata track (TMF), as the camera writes it
 
 See ``docs/data_formats.md`` for the on-disk file layout.
 """

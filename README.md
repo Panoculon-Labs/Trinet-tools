@@ -318,6 +318,34 @@ milliseconds apart at the exposure centre — the frames CSV reports that offset
 instead of hiding it. Recordings in `.vts` v5 already carry the offset for
 every frame and don't need this step.
 
+### Cut a recording to a segment (still a Trinet recording)
+
+`cut_recording.py` cuts one camera or a whole wrist kit to a time window. The
+result is itself a valid Trinet recording: the same file names and folders, the
+video copied frame for frame (no re-encoding, so nothing is lost), the sound kept
+and in step with the picture, and the `.vts` / `.imu` / `.tel` sidecars and the
+embedded metadata track (TMF) cut to match. Every Trinet tool reads it like an
+original take.
+
+```bash
+# 12.4 s to 40 s into the take (seconds from the first frame of any camera)
+python scripts/cut_recording.py take_folder/ --from 12.4 --to 40 -o segment/
+
+# the same window on the master clock, in nanoseconds
+python scripts/cut_recording.py take_folder/ --t0-ns 298318745942 --t1-ns 325918745942 -o segment/
+```
+
+Each camera starts at its own last keyframe at or before the start — up to one
+keyframe interval (about a second) early, because cameras' keyframes are not
+aligned — and ends at its last frame before the end. Master-clock frame times are
+unchanged, so the cameras of a cut kit stay in sync. The `.imu` and `.tel` keep
+one second around the frames. The cut's `tmfm` metadata says where it came from
+(`"cut": {"source", "first_frame", "last_frame", "t0_ns", "t1_ns"}`). A source
+without embedded metadata (e.g. a re-muxed file) gets it rebuilt from its
+sidecars. Fragmented recordings must be repaired first (`repair_recordings.py`);
+files with B-frames are refused. Library: `trinet_tools.cut.cut_recording` /
+`cut_camera`; the TMF writer on its own is `trinet_tools.tmf_write`.
+
 ### Export to MCAP (Foxglove / ROS 2)
 
 Convert any recording (single camera or stereo, global or rolling shutter,

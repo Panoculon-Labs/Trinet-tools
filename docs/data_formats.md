@@ -364,6 +364,13 @@ so `.imu` reconstruction is IHDR + rows rebuilt from the columns; `TFRM` and
   recovered after a power loss). [`wireless_utc.md`](wireless_utc.md) uses it to
   tie a take to the camera boot the phone heard.
 
+  A recording cut with `scripts/cut_recording.py` keeps the camera's identity
+  keys, recomputes `sync` / `drops` / `thermal` for the cut, sets
+  `"generator": "trinet-tools-cut"` and adds
+  `"cut": {"source": "<original mp4>", "first_frame": k0, "last_frame": k1,
+  "t0_ns": …, "t1_ns": …}` (frame indices of the original; times on the master
+  clock).
+
   `drops` is the camera's own frame-continuity summary for the take (gaps
   detected from per-frame timestamps, list capped at 64); `sync` mirrors the
   `.vts` v3 multi-camera clock block; `thermal` is the `.tel` min/max envelope.

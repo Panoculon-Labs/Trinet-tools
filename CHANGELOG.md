@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — cut a recording to a segment (`scripts/cut_recording.py`)
+
+Cuts one camera or a whole wrist kit to a time window on the master clock; the
+cut is itself a valid Trinet recording.
+
+- Video is copied frame for frame (no re-encoding). Each camera starts at its own
+  last keyframe at or before the start (at most one keyframe interval early) and
+  ends at its last frame before the end. The movie index is written first.
+- Sound is kept: the AAC frames covering the video plus one frame of decoder
+  pre-roll, with an edit list; on the sample kits the cut's sound matches the
+  original's to the sample (0.0 ms lag).
+- `.vts`: master-clock frame times are unchanged (v5 per-frame offsets; on v3/v4
+  with a clock skew the header offset is re-referenced to the new first frame, to
+  within 1 ns). `.imu` / `.tel`: one second around the frames, headers updated.
+  `.json` sidecars and calibration files are copied.
+- The embedded metadata track is rebuilt from the cut sidecars by the new
+  `trinet_tools.tmf_write`, a port of the camera's encoder: folding a camera's
+  whole sidecars reproduces its own `tmfd` payloads, durations and `tmfm` JSON
+  byte for byte (all seven sample files that carry TMF).
+- About 0.3 s per GB on a laptop SSD (the video is a kernel-level copy).
+
 ## Unreleased — get a camera's calibration (`scripts/get_calibration.py`)
 
 Reads the calibration stored on a camera and writes it as `calibration.json`,
