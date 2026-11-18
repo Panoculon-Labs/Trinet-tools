@@ -132,7 +132,7 @@ read their sample size from the version.
 | 18     | 2    | uint16   | gyro_fs          | 0=±250, 1=±500, 2=±1000, 3=±2000 dps             |
 | 20     | 8    | uint64   | start_time_ns    | monotonic ns of first sample in this file        |
 | 28     | 8    | uint64   | video_start_ns   | monotonic ns of first video frame (0 if unknown) |
-| 36     | 4    | uint32   | flags            | v3+: bit 0 = frame-sync alignment captured; bit 1 = magnetometer present (v5) |
+| 36     | 4    | uint32   | flags            | v3+: bit 0 = frame-sync alignment captured; bit 1 = magnetometer present (v5); bit 2 = timestamps rate-disciplined to the camera clock; bit 3 = `HEAD_OVERLAP` (firmware 0.5.16+, chunk parts only: the file's first samples repeat the end of the previous part, so that this part covers its own first frame — when joining parts, drop samples at or before the previous part's last timestamp) |
 | 40     | 16   | bytes    | device_id        | v3+: public per-unit ID (all-zero if unknown); see [Device ID](#device-id) |
 | 56     | 8    | int64    | ios_host_offset_ns | v4+: ns offset aligning these timestamps to an iOS host clock (0 = none) |
 
@@ -223,7 +223,7 @@ already the correct per-camera clock.
 
 | offset | size | type     | field             | meaning                                                |
 | ------ | ---- | -------- | ----------------- | ------------------------------------------------------ |
-| 0      | 4    | uint32   | frame_number      | 0-based index into this MP4 file                       |
+| 0      | 4    | uint32   | frame_number      | which camera trigger this frame belongs to, counted from the take's (or part's) first saved frame — see "Pairing stereo eyes" below |
 | 4      | 8    | uint64   | sof_timestamp_ns  | per-frame capture time, monotonic ns (best clock for sync); 0 if unavailable. **Mid-exposure** in v4 when `entry_flags` bit 0 is set; otherwise start-of-frame. References the **middle row** when bit 3 (`FRAME_CENTERED`) is set, else the **top row**. |
 | 12     | 4    | uint32   | venc_seq          | encoder-internal sequence number (v2+)                 |
 | 16     | 8    | uint64   | venc_pts_us       | encoder presentation timestamp in microseconds (v2+). **Delivery timeline — do not use for IMU sync.** |
@@ -244,6 +244,22 @@ row it references. For per-row (rolling-shutter) reconstruction, branch on the
 `docs/imu_video_sync.md`. `venc_pts_us` is useful for matching the entry to a
 packet you read from the MP4, but is delayed by encoder pipeline latency relative
 to the actual capture instant.
+
+**Pairing stereo eyes.** Row *i* of a `.vts` always describes video frame *i*
+of its MP4. `frame_number` names the camera trigger: in a stereo recording both
+eyes number the same trigger the same, so **pair `_L` and `_R` frames by
+`frame_number`, not by position**. With firmware 0.5.16 and later both files
+start at `frame_number` 0 and end on the same number, so they also have the
+same frames. Earlier stereo firmware could start one eye a frame later (its
+first row reads `frame_number` 1) or end one eye a frame later; pairing by
+`frame_number` handles both. A number present in only one file is a frame that
+eye dropped. In mono recordings `frame_number` is simply the MP4 frame index.
+
+**`PHASE_UNLOCKED` (entry_flags bit 4)** concerns multi-camera groups: the
+camera's frame phase relative to the group's master camera had not converged.
+It says nothing about the two eyes of one stereo camera, which are always
+exposed together. A camera set to follow a group master that it cannot reach
+sets it on every frame; for a camera used on its own it can be ignored.
 
 In chunked recordings, `frame_number` resets to 0 at the start of each part —
 so each part's `.vts` reads independently.
