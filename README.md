@@ -165,6 +165,24 @@ python3 scripts/repair_recordings.py /path/to/recordings --dry-run
 
 Already-standard files are left untouched, and re-running is safe (idempotent).
 
+### Encrypted recordings: make a key, decrypt a card
+
+With camera firmware 0.5.16 or newer the camera can encrypt everything it writes
+to its card (guide: https://docs.panoculonlabs.com/data/encryption/). Make the
+key pair once, install the `.tvk` on the camera from the Trinet app, and keep
+the `.pem` secret:
+
+```bash
+python3 scripts/decrypt_recordings.py keygen my_key.pem my_key.tvk --passphrase
+
+# Decrypt a take, a folder or a whole card into ordinary recordings
+# (originals untouched; keep each take's .tkey with it):
+python3 scripts/decrypt_recordings.py decrypt --key my_key.pem --out decrypted/ /media/SD/Trinet
+```
+
+A private key that isn't the take's key is refused with the take's key ID, and
+nothing is written for that take.
+
 ### Parse a recording in Python
 
 ```python

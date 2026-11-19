@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — decrypt encrypted recordings (`scripts/decrypt_recordings.py`)
+
+Camera firmware 0.5.16 can encrypt card recordings to the owner's RSA-2048 key
+(guide: https://docs.panoculonlabs.com/data/encryption/). This adds the tool
+that makes the key pair (`keygen`, `export-pubkey`; `export-signing-key` writes
+an unencrypted copy of the private key for a phone that cannot open a
+passphrase-protected one) and decrypts a take, a folder or a whole card
+(`decrypt`) into ordinary recordings: the MP4 keeps its layout and decodes to
+the original frames, the `.imu` / `.vts` / `.tel` come back byte-identical.
+Stereo takes (both eyes, one `.tkey`) and split recordings are handled. A wrong
+private key is refused with the take's key ID, and a take that fails leaves no
+output behind. Library: `trinet_tools.decrypt`. Needs `cryptography`.
+Tested on a take encrypted by the camera's own code
+(`tests/fixtures/encrypted_take`, with a throw-away test key).
+
 ## Unreleased — check recordings and kit takes (`scripts/check_recording.py`)
 
 One report per take: frames in the `.vts` and the `.mp4`, dropped frames

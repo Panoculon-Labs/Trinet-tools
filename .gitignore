@@ -31,3 +31,8 @@ test-av/
 
 # Neural stereo model weights (local only, never committed)
 models/**/*.onnx
+
+# Encrypted-take fixture for tests/test_decrypt.py (tiny; made with the camera's own encryption)
+!tests/fixtures/encrypted_take/*.mp4
+!tests/fixtures/encrypted_take/*.imu
+!tests/fixtures/encrypted_take/expected/*.imu
